@@ -1,250 +1,302 @@
 /**
  * AI Code Editor - Terminal Module
- * Handles xterm.js terminal functionality with WebSocket connection
+ * Handles multiple xterm.js terminal instances with WebSocket connections
  */
 
 class TerminalManager {
     constructor() {
-        this.terminal = null;
-        this.fitAddon = null;
+        this.terminals = new Map(); // id -> { id, name, terminal, fitAddon, websocket, isConnected, reconnectAttempts }
+        this.activeTerminalId = null;
+        this.terminalCount = 0;
         this.isCollapsed = false;
-        this.commandHistory = [];
-        this.historyIndex = -1;
-        this.websocket = null;
-        this.isConnected = false;
-        this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 5;
     }
 
     /**
-     * Initialize the terminal
+     * Initialize the terminal manager
      */
     init() {
-        const container = document.getElementById('terminalContainer');
+        this.setupGlobalEventListeners();
+
+        // Create the first terminal
+        this.createNewTerminal();
+    }
+
+    /**
+     * Create a new terminal instance
+     */
+    createNewTerminal() {
+        const id = `term-${Date.now()}`;
+        const name = `Terminal ${++this.terminalCount}`;
+        const mainContainer = document.getElementById('terminalContainer');
+
+        // Create container for this specific terminal
+        const container = document.createElement('div');
+        container.id = `container-${id}`;
+        container.className = 'terminal-instance';
+        container.style.height = '100%';
+        mainContainer.appendChild(container);
 
         // Create terminal instance
-        this.terminal = new Terminal({
+        const terminal = new Terminal({
             ...CONFIG.TERMINAL,
             cols: 80,
             rows: 10,
             cursorBlink: true
         });
 
-        // Create fit addon for auto-sizing
-        this.fitAddon = new FitAddon.FitAddon();
-        this.terminal.loadAddon(this.fitAddon);
+        // Create fit addon
+        const fitAddon = new FitAddon.FitAddon();
+        terminal.loadAddon(fitAddon);
 
-        // Open terminal in container
-        this.terminal.open(container);
+        // Open terminal in its container
+        terminal.open(container);
 
-        // Fit to container
-        this.fit();
+        const terminalData = {
+            id,
+            name,
+            terminal,
+            fitAddon,
+            websocket: null,
+            isConnected: false,
+            reconnectAttempts: 0
+        };
+
+        this.terminals.set(id, terminalData);
+
+        // Switch to the new terminal
+        this.switchTerminal(id);
+
+        // Setup terminal individual listeners
+        terminal.onData(data => this.sendToWebSocket(data, id));
 
         // Write initial message
-        this.writeWelcome();
+        this.writeWelcome(terminal);
 
-        // Setup event listeners
-        this.setupEventListeners();
+        // Connect WebSocket
+        this.connectWebSocket(id);
 
-        // Connect to WebSocket terminal
-        this.connectWebSocket();
+        // Update tabs
+        this.renderTabs();
+
+        return id;
     }
 
     /**
-     * Connect to WebSocket terminal
+     * Switch to a specific terminal
      */
-    connectWebSocket() {
-        // Close existing connection first
-        if (this.websocket) {
-            this.websocket.onclose = null; // Prevent auto-reconnect
-            this.websocket.close();
-            this.websocket = null;
-            this.isConnected = false;
+    switchTerminal(id) {
+        if (!this.terminals.has(id)) return;
+
+        // Hide current active terminal
+        if (this.activeTerminalId) {
+            const currentContainer = document.getElementById(`container-${this.activeTerminalId}`);
+            if (currentContainer) currentContainer.style.display = 'none';
         }
 
-        // Clear terminal and show connecting message
-        if (this.terminal) {
-            this.terminal.clear();
-            this.terminal.writeln('\x1b[33m🔄 Connecting to terminal...\x1b[0m');
+        // Show new active terminal
+        const newContainer = document.getElementById(`container-${id}`);
+        if (newContainer) newContainer.style.display = 'block';
+
+        this.activeTerminalId = id;
+
+        // Update tabs UI
+        this.renderTabs();
+
+        // Fit the terminal
+        setTimeout(() => this.fit(id), 0);
+
+        // Focus the terminal
+        this.terminals.get(id).terminal.focus();
+    }
+
+    /**
+     * Close a terminal instance
+     */
+    closeTerminal(id) {
+        const data = this.terminals.get(id);
+        if (!data) return;
+
+        // Don't close if it's the last one (or create a new one after)
+        if (this.terminals.size === 1) {
+            this.createNewTerminal();
         }
+
+        // Close WebSocket
+        if (data.websocket) {
+            data.websocket.onclose = null;
+            data.websocket.close();
+        }
+
+        // Dispose terminal
+        data.terminal.dispose();
+
+        // Remove container
+        const container = document.getElementById(`container-${id}`);
+        if (container) container.remove();
+
+        // Remove from list
+        this.terminals.delete(id);
+
+        // If it was active, switch to another
+        if (this.activeTerminalId === id) {
+            const nextId = Array.from(this.terminals.keys())[0];
+            this.switchTerminal(nextId);
+        } else {
+            this.renderTabs();
+        }
+    }
+
+    /**
+     * Connect a terminal to its WebSocket
+     */
+    connectWebSocket(id) {
+        const data = this.terminals.get(id);
+        if (!data) return;
+
+        // Close existing if any
+        if (data.websocket) {
+            data.websocket.onclose = null;
+            data.websocket.close();
+            data.websocket = null;
+        }
+
+        data.terminal.writeln('\x1b[33m🔄 Connecting to terminal...\x1b[0m');
 
         const wsUrl = CONFIG.API_BASE_URL.replace('http', 'ws') + '/terminal/ws/terminal';
 
         try {
-            this.websocket = new WebSocket(wsUrl);
+            data.websocket = new WebSocket(wsUrl);
 
-            this.websocket.onopen = () => {
-                this.isConnected = true;
-                this.reconnectAttempts = 0;
-                console.log('✅ Terminal WebSocket connected');
+            data.websocket.onopen = () => {
+                data.isConnected = true;
+                data.reconnectAttempts = 0;
+                console.log(`✅ Terminal ${id} connected`);
+                // Clear the connecting message
+                data.terminal.write('\r\x1b[K'); // Carriage return and clear line
             };
 
-            this.websocket.onmessage = (event) => {
-                // Write received data to terminal
-                this.terminal.write(event.data);
+            data.websocket.onmessage = (event) => {
+                data.terminal.write(event.data);
             };
 
-            this.websocket.onclose = () => {
-                this.isConnected = false;
-                console.log('🔌 Terminal WebSocket disconnected');
+            data.websocket.onclose = () => {
+                data.isConnected = false;
+                console.log(`🔌 Terminal ${id} disconnected`);
 
-                // Try to reconnect only if not manually disconnected
-                if (this.reconnectAttempts < this.maxReconnectAttempts) {
-                    this.reconnectAttempts++;
-                    setTimeout(() => this.connectWebSocket(), 2000);
+                if (data.reconnectAttempts < this.maxReconnectAttempts) {
+                    data.reconnectAttempts++;
+                    setTimeout(() => this.connectWebSocket(id), 2000);
                 }
             };
 
-            this.websocket.onerror = (error) => {
-                console.error('Terminal WebSocket error:', error);
+            data.websocket.onerror = (error) => {
+                console.error(`Terminal ${id} WebSocket error:`, error);
             };
 
         } catch (error) {
-            console.error('Failed to connect WebSocket:', error);
+            console.error(`Failed to connect WebSocket for ${id}:`, error);
         }
     }
 
     /**
-     * Send data to WebSocket
+     * Send data to terminal's WebSocket
      */
-    sendToWebSocket(data) {
-        if (this.websocket && this.isConnected) {
-            this.websocket.send(data);
+    sendToWebSocket(data, id = this.activeTerminalId) {
+        const terminalData = this.terminals.get(id);
+        if (terminalData && terminalData.websocket && terminalData.isConnected) {
+            terminalData.websocket.send(data);
         }
     }
 
     /**
-     * Run a command in the terminal (like VS Code)
-     * This sends the command to WebSocket and executes it
+     * Run a command (public API)
      */
-    runCommand(command) {
-        if (!this.isConnected) {
-            this.writeWarning('Terminal not connected. Trying to reconnect...');
-            this.connectWebSocket();
+    runCommand(command, id = this.activeTerminalId) {
+        const data = this.terminals.get(id);
+        if (!data) return;
+
+        if (!data.isConnected) {
+            this.connectWebSocket(id);
+            // We could buffer it, but simpler to just try reconnecting
             return;
         }
 
-        // Send the command followed by Enter
-        this.sendToWebSocket(command + '\r');
+        this.sendToWebSocket(command + '\r', id);
     }
 
     /**
-     * Change directory in terminal
+     * Change directory
      */
-    changeDirectory(path) {
-        this.runCommand(`cd "${path}"`);
-    }
-
-    /**
-     * Write welcome message
-     */
-    writeWelcome() {
-        this.terminal.writeln('\x1b[1;36m╔════════════════════════════════════════╗\x1b[0m');
-        this.terminal.writeln('\x1b[1;36m║\x1b[0m   \x1b[1;33mAI Code Editor Terminal\x1b[0m              \x1b[1;36m║\x1b[0m');
-        this.terminal.writeln('\x1b[1;36m╚════════════════════════════════════════╝\x1b[0m');
-        this.terminal.writeln('');
-        this.terminal.writeln('\x1b[32m✓\x1b[0m Terminal ready. Connecting to backend...');
-        this.terminal.writeln('');
-    }
-
-    /**
-     * Write text to terminal
-     */
-    write(text) {
-        if (this.terminal) {
-            this.terminal.write(text);
+    changeDirectory(path, id = this.activeTerminalId) {
+        this.runCommand(`cd "${path}"`, id);
+        // Show brief notification but don't spam if many terminals
+        if (id === this.activeTerminalId) {
+            window.toast?.info(`Syncing terminal to: ${path.split(/[\\/]/).pop()}`);
         }
     }
 
     /**
-     * Write line to terminal
+     * Write welcome message to a terminal
      */
-    writeln(text) {
-        if (this.terminal) {
-            this.terminal.writeln(text);
+    writeWelcome(terminal) {
+        terminal.writeln('\x1b[1;36m╔════════════════════════════════════════╗\x1b[0m');
+        terminal.writeln('\x1b[1;36m║\x1b[0m   \x1b[1;33mAI Code Editor Terminal\x1b[0m              \x1b[1;36m║\x1b[0m');
+        terminal.writeln('\x1b[1;36m╚════════════════════════════════════════╝\x1b[0m');
+        terminal.writeln('');
+    }
+
+    /**
+     * Render terminal tabs in the header
+     */
+    renderTabs() {
+        const tabsContainer = document.getElementById('terminalTabs');
+        if (!tabsContainer) return;
+
+        tabsContainer.innerHTML = '';
+
+        this.terminals.forEach((data, id) => {
+            const tab = document.createElement('div');
+            tab.className = `terminal-tab ${id === this.activeTerminalId ? 'active' : ''}`;
+            tab.dataset.id = id;
+
+            tab.innerHTML = `
+                <i data-lucide="terminal"></i>
+                <span class="tab-label">${data.name}</span>
+                <span class="terminal-tab-close" title="Close Terminal">
+                    <i data-lucide="x"></i>
+                </span>
+            `;
+
+            tab.addEventListener('click', (e) => {
+                if (!e.target.closest('.terminal-tab-close')) {
+                    this.switchTerminal(id);
+                }
+            });
+
+            tab.querySelector('.terminal-tab-close').addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.closeTerminal(id);
+            });
+
+            tabsContainer.appendChild(tab);
+        });
+
+        if (window.lucide) {
+            lucide.createIcons();
         }
     }
 
     /**
-     * Write success message (green)
+     * Fit terminal to container
      */
-    writeSuccess(text) {
-        this.writeln(`\x1b[32m${text}\x1b[0m`);
-    }
-
-    /**
-     * Write error message (red)
-     */
-    writeError(text) {
-        this.writeln(`\x1b[31m${text}\x1b[0m`);
-    }
-
-    /**
-     * Write warning message (yellow)
-     */
-    writeWarning(text) {
-        this.writeln(`\x1b[33m${text}\x1b[0m`);
-    }
-
-    /**
-     * Write info message (blue)
-     */
-    writeInfo(text) {
-        this.writeln(`\x1b[34m${text}\x1b[0m`);
-    }
-
-    /**
-     * Write command with timestamp
-     */
-    writeCommand(command) {
-        const timestamp = new Date().toLocaleTimeString();
-        this.writeln(`\x1b[90m[${timestamp}]\x1b[0m \x1b[1;36m$\x1b[0m ${command}`);
-    }
-
-    /**
-     * Write execution result
-     */
-    writeResult(output, error = false) {
-        if (error) {
-            this.writeError(output);
-        } else {
-            this.writeln(output);
-        }
-    }
-
-    /**
-     * Write execution header
-     */
-    writeExecutionHeader(filename, language) {
-        this.writeln('');
-        this.writeln('\x1b[90m─────────────────────────────────────────\x1b[0m');
-        this.writeln(`\x1b[1;35m▶ Running:\x1b[0m ${filename} \x1b[90m(${language})\x1b[0m`);
-        this.writeln('\x1b[90m─────────────────────────────────────────\x1b[0m');
-    }
-
-    /**
-     * Write execution footer
-     */
-    writeExecutionFooter(exitCode, duration) {
-        this.writeln('');
-        this.writeln('\x1b[90m─────────────────────────────────────────\x1b[0m');
-        if (exitCode === 0) {
-            this.writeln(`\x1b[32m✓ Process finished\x1b[0m \x1b[90m(${duration}ms)\x1b[0m`);
-        } else {
-            this.writeln(`\x1b[31m✗ Process failed with exit code ${exitCode}\x1b[0m \x1b[90m(${duration}ms)\x1b[0m`);
-        }
-        this.writeln('');
-    }
-
-    /**
-     * Clear terminal
-     */
-    clear() {
-        if (this.terminal) {
-            this.terminal.clear();
-            // Send clear command to backend if connected
-            if (this.isConnected) {
-                this.sendToWebSocket('clear\r');
+    fit(id = this.activeTerminalId) {
+        const data = this.terminals.get(id);
+        if (data && data.fitAddon && !this.isCollapsed) {
+            try {
+                data.fitAddon.fit();
+            } catch (e) {
+                // Ignore fit errors
             }
         }
     }
@@ -259,47 +311,36 @@ class TerminalManager {
         this.isCollapsed = !this.isCollapsed;
         wrapper.classList.toggle('collapsed', this.isCollapsed);
 
-        // Update toggle button icon
         const icon = toggleBtn.querySelector('[data-lucide]');
         if (icon) {
             icon.setAttribute('data-lucide', this.isCollapsed ? 'chevron-up' : 'chevron-down');
             lucide.createIcons();
         }
 
-        // Re-layout editor
         setTimeout(() => {
             window.editorManager?.layout();
             if (!this.isCollapsed) {
-                this.fit();
+                this.fit(this.activeTerminalId);
             }
         }, 100);
     }
 
     /**
-     * Fit terminal to container
+     * Setup global event listeners
      */
-    fit() {
-        if (this.fitAddon && !this.isCollapsed) {
-            try {
-                this.fitAddon.fit();
-            } catch (e) {
-                // Ignore fit errors during initialization
-            }
-        }
-    }
-
-    /**
-     * Setup event listeners
-     */
-    setupEventListeners() {
-        // Send terminal input to WebSocket
-        this.terminal.onData(data => {
-            this.sendToWebSocket(data);
+    setupGlobalEventListeners() {
+        // New terminal button
+        document.getElementById('newTerminalBtn')?.addEventListener('click', () => {
+            this.createNewTerminal();
         });
 
-        // Clear button
+        // Clear button (clears active terminal)
         document.getElementById('clearTerminalBtn')?.addEventListener('click', () => {
-            this.clear();
+            const data = this.terminals.get(this.activeTerminalId);
+            if (data) {
+                data.terminal.clear();
+                if (data.isConnected) data.websocket.send('clear\r');
+            }
         });
 
         // Toggle button
@@ -309,27 +350,50 @@ class TerminalManager {
 
         // Handle resize
         window.addEventListener('resize', () => {
-            this.fit();
+            this.fit(this.activeTerminalId);
         });
 
-        // Keyboard shortcut for toggle
+        // Keyboard shortcuts
         document.addEventListener('keydown', (e) => {
             if (e.ctrlKey && e.key === 'j') {
                 e.preventDefault();
                 this.toggle();
             }
+            if (e.ctrlKey && e.shiftKey && e.key === '`') {
+                e.preventDefault();
+                this.createNewTerminal();
+            }
         });
     }
 
     /**
-     * Dispose terminal
+     * Clear active terminal
      */
-    dispose() {
-        if (this.websocket) {
-            this.websocket.close();
+    clear() {
+        const data = this.terminals.get(this.activeTerminalId);
+        if (data) {
+            data.terminal.clear();
         }
-        if (this.terminal) {
-            this.terminal.dispose();
+    }
+
+    /**
+     * Write an error message to the active terminal
+     */
+    writeError(message) {
+        const data = this.terminals.get(this.activeTerminalId);
+        if (data && data.terminal) {
+            data.terminal.writeln(`\r\n\x1b[1;31mError: ${message}\x1b[0m`);
+        }
+    }
+
+    /**
+     * Write a message to a specific or active terminal
+     */
+    write(message, terminalId = null) {
+        const id = terminalId || this.activeTerminalId;
+        const data = this.terminals.get(id);
+        if (data && data.terminal) {
+            data.terminal.write(message);
         }
     }
 }

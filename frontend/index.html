@@ -17,6 +17,14 @@
     <!-- Monaco Editor Loader - loads LAST to avoid AMD conflicts with xterm and lucide -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
 
+    <!-- Markdown and Syntax Highlighting -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+
+    <!-- Diffing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/diff_match_patch/20121119/diff_match_patch.js"></script>
+
     <!-- Custom Styles -->
     <link rel="stylesheet" href="css/main.css">
 </head>
@@ -42,8 +50,12 @@
                 <i data-lucide="play"></i>
                 <span>Run</span>
             </button>
-            <button class="header-btn" id="themeToggle" title="Toggle Theme">
-                <i data-lucide="moon"></i>
+            <button class="header-btn" id="splitBtn" title="Split Editor">
+                <i data-lucide="columns"></i>
+                <span>Split</span>
+            </button>
+            <button class="header-btn" id="settingsBtn" title="Settings">
+                <i data-lucide="settings"></i>
             </button>
         </div>
     </header>
@@ -91,32 +103,74 @@
                 </div>
             </div>
 
-            <!-- Editor Container -->
-            <div class="editor-wrapper">
-                <div class="editor-container" id="editorContainer">
-                    <!-- Monaco Editor will be mounted here -->
+            <!-- Editor Toolbar -->
+            <div class="editor-toolbar" id="editorToolbar">
+                <div class="toolbar-group">
+                    <button class="icon-btn" id="formatCodeBtn" title="Format Document">
+                        <i data-lucide="wand-2"></i>
+                    </button>
+                    <button class="icon-btn" id="toggleWordWrapBtn" title="Toggle Word Wrap">
+                        <i data-lucide="wrap-text"></i>
+                    </button>
                 </div>
-
-                <!-- Resizer: Editor <-> Terminal -->
-                <div class="resizer resizer-horizontal" id="resizerBottom"></div>
-
-                <!-- Terminal Container -->
-                <div class="terminal-wrapper" id="terminalWrapper">
-                    <div class="terminal-header">
-                        <span>Terminal</span>
-                        <div class="terminal-actions">
-                            <button class="icon-btn" id="clearTerminalBtn" title="Clear">
-                                <i data-lucide="trash-2"></i>
-                            </button>
-                            <button class="icon-btn" id="toggleTerminalBtn" title="Toggle Terminal">
-                                <i data-lucide="chevron-down"></i>
-                            </button>
-                        </div>
-                    </div>
-                    <div class="terminal-container" id="terminalContainer">
-                        <!-- xterm.js will be mounted here -->
+                <div class="toolbar-separator"></div>
+                <div class="toolbar-group">
+                    <button class="icon-btn" id="fontLessBtn" title="Decrease Font Size">
+                        <i data-lucide="minus"></i>
+                    </button>
+                    <span class="toolbar-text" id="fontSizeLabel">14px</span>
+                    <button class="icon-btn" id="fontMoreBtn" title="Increase Font Size">
+                        <i data-lucide="plus"></i>
+                    </button>
+                </div>
+                <div class="toolbar-spacer"></div>
+                <div class="toolbar-group">
+                    <div class="breadcrumb" id="breadcrumb">
+                        <span class="breadcrumb-item">index.html</span>
                     </div>
                 </div>
+            </div>
+
+            <!-- Editor Split View -->
+            <div class="editor-split-view" id="editorSplitView">
+                <div class="editor-pane active" id="paneLeft">
+                    <div class="editor-container" id="editorContainer">
+                        <!-- Monaco Editor will be mounted here -->
+                    </div>
+                </div>
+                <div class="split-resizer" id="splitResizer" style="display:none"></div>
+                <div class="editor-pane" id="paneRight" style="display:none">
+                    <div class="editor-container" id="secondaryEditorContainer">
+                        <!-- Secondary Monaco Editor will be mounted here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Resizer: Editor <-> Terminal -->
+            <div class="resizer resizer-horizontal" id="resizerBottom"></div>
+
+            <!-- Terminal Container -->
+            <div class="terminal-wrapper" id="terminalWrapper">
+                <div class="terminal-header">
+                    <div class="terminal-tabs" id="terminalTabs">
+                        <!-- Terminal tabs will be rendered here -->
+                    </div>
+                    <div class="terminal-actions">
+                        <button class="icon-btn" id="newTerminalBtn" title="New Terminal">
+                            <i data-lucide="plus"></i>
+                        </button>
+                        <button class="icon-btn" id="clearTerminalBtn" title="Clear">
+                            <i data-lucide="trash-2"></i>
+                        </button>
+                        <button class="icon-btn" id="toggleTerminalBtn" title="Toggle Terminal">
+                            <i data-lucide="chevron-down"></i>
+                        </button>
+                    </div>
+                </div>
+                <div class="terminal-container" id="terminalContainer">
+                    <!-- xterm.js will be mounted here -->
+                </div>
+            </div>
             </div>
         </section>
 
@@ -128,6 +182,12 @@
             <div class="panel-header">
                 <span>AI Assistant</span>
                 <div class="panel-actions">
+                    <button class="icon-btn" id="newChatBtn" title="New Chat">
+                        <i data-lucide="plus"></i>
+                    </button>
+                    <button class="icon-btn" id="chatHistoryBtn" title="Chat History">
+                        <i data-lucide="history"></i>
+                    </button>
                     <button class="icon-btn" id="clearChatBtn" title="Clear Chat">
                         <i data-lucide="trash-2"></i>
                     </button>
@@ -242,13 +302,222 @@
         </div>
     </div>
 
+    <!-- Quick Box Modal (Ctrl+K / Ctrl+P) -->
+    <div class="quick-box-overlay" id="quickBoxOverlay" style="display: none;">
+        <div class="quick-box" id="quickBox">
+            <div class="quick-box-header">
+                <i data-lucide="search" id="quickBoxIcon"></i>
+                <input type="text" id="quickBoxInput" placeholder="Search files or commands..." autocomplete="off">
+            </div>
+            <div class="quick-box-results" id="quickBoxResults">
+                <!-- Results will be rendered here -->
+            </div>
+            <div class="quick-box-footer">
+                <div class="footer-item">
+                    <kbd>↑↓</kbd> <span>Navigate</span>
+                </div>
+                <div class="footer-item">
+                    <kbd>Enter</kbd> <span>Select</span>
+                </div>
+                <div class="footer-item">
+                    <kbd>Esc</kbd> <span>Close</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chat History Modal -->
+    <div class="modal-overlay" id="chatHistoryModal">
+        <div class="modal chat-history-modal">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <i data-lucide="history"></i>
+                    <span>Chat History</span>
+                </div>
+                <button class="close-modal" id="closeChatHistoryBtn">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <div class="modal-container">
+                <div class="history-list" id="historyList">
+                    <!-- History items will be rendered here -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" id="clearHistoryBtn">
+                    <i data-lucide="trash-2"></i>
+                    <span>Clear All History</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toastContainer" class="toast-container"></div>
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settingsModal">
+        <div class="modal settings-modal">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <i data-lucide="settings"></i>
+                    <span>Settings</span>
+                </div>
+                <button class="close-modal" id="closeSettingsBtn">
+                    <i data-lucide="x"></i>
+                </button>
+            </div>
+            <div class="modal-container">
+                <div class="settings-sidebar">
+                    <div class="settings-nav-item active" data-target="settings-general">
+                        <i data-lucide="layout"></i>
+                        <span>General</span>
+                    </div>
+                    <div class="settings-nav-item" data-target="settings-editor">
+                        <i data-lucide="file-code"></i>
+                        <span>Editor</span>
+                    </div>
+                    <div class="settings-nav-item" data-target="settings-ai">
+                        <i data-lucide="bot"></i>
+                        <span>AI Agent</span>
+                    </div>
+                    <div class="settings-nav-item" data-target="settings-shortcuts">
+                        <i data-lucide="keyboard"></i>
+                        <span>Shortcuts</span>
+                    </div>
+                </div>
+                <div class="settings-content">
+                    <!-- General Settings -->
+                    <div class="settings-section active" id="settings-general">
+                        <h2>General</h2>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <label>Appearance</label>
+                                <p>Select your preferred color theme</p>
+                            </div>
+                            <div class="setting-control">
+                                <select id="setting-theme" class="settings-select">
+                                    <option value="dark">Dark (Default)</option>
+                                    <option value="light">Light</option>
+                                    <option value="midnight">Midnight OLED</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Editor Settings -->
+                    <div class="settings-section" id="settings-editor">
+                        <h2>Editor</h2>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <label>Font Size</label>
+                                <p>Adjust the editor text size</p>
+                            </div>
+                            <div class="setting-control">
+                                <div class="font-size-control">
+                                    <input type="range" id="setting-fontSize" min="10" max="24" step="1" value="14">
+                                    <span id="setting-fontSizeValue">14px</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <label>Word Wrap</label>
+                                <p>Toggle long line wrapping</p>
+                            </div>
+                            <div class="setting-control">
+                                <label class="switch">
+                                    <input type="checkbox" id="setting-wordWrap">
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <label>Minimap</label>
+                                <p>Show architectural overview of code</p>
+                            </div>
+                            <div class="setting-control">
+                                <label class="switch">
+                                    <input type="checkbox" id="setting-minimap" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <label>Line Numbers</label>
+                                <p>Toggle editor line numbers</p>
+                            </div>
+                            <div class="setting-control">
+                                <label class="switch">
+                                    <input type="checkbox" id="setting-lineNumbers" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- AI Settings -->
+                    <div class="settings-section" id="settings-ai">
+                        <h2>AI Agent</h2>
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <label>Streaming Responses</label>
+                                <p>See AI responses in real-time</p>
+                            </div>
+                            <div class="setting-control">
+                                <label class="switch">
+                                    <input type="checkbox" id="setting-aiStreaming" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Shortcuts Settings -->
+                    <div class="settings-section" id="settings-shortcuts">
+                        <h2>Keyboard Shortcuts</h2>
+                        <div class="shortcuts-list">
+                            <div class="shortcut-item">
+                                <span class="shortcut-desc">Open File</span>
+                                <span class="shortcut-key">Ctrl+P</span>
+                            </div>
+                            <div class="shortcut-item">
+                                <span class="shortcut-desc">Save File</span>
+                                <span class="shortcut-key">Ctrl+S</span>
+                            </div>
+                            <div class="shortcut-item">
+                                <span class="shortcut-desc">Run Code</span>
+                                <span class="shortcut-key">Ctrl+R</span>
+                            </div>
+                            <div class="shortcut-item">
+                                <span class="shortcut-desc">Split Editor</span>
+                                <span class="shortcut-key">Ctrl+\</span>
+                            </div>
+                            <div class="shortcut-item">
+                                <span class="shortcut-desc">Toggle AI Panel</span>
+                                <span class="shortcut-key">Ctrl+/</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Scripts -->
     <script src="js/config.js"></script>
+    <script src="js/toast.js"></script>
+    <script src="js/contextMenu.js"></script>
+    <script src="js/diffViewer.js"></script>
     <script src="js/fileTree.js"></script>
     <script src="js/editor.js"></script>
     <script src="js/terminal.js"></script>
     <script src="js/agent.js"></script>
+    <script src="js/quickBox.js"></script>
     <script src="js/resizer.js"></script>
+    <script src="js/settings.js"></script>
     <script src="js/app.js"></script>
 </body>
 

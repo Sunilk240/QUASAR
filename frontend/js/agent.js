@@ -6,6 +6,7 @@
 class AgentManager {
     constructor() {
         this.messages = [];
+        this.chatHistory = []; // Store conversation sessions
         this.isLoading = false;
         this.currentModel = 'auto'; // Model being used by AI (indicator)
         this.selectedModel = localStorage.getItem('quasar_selected_model') || 'Auto'; // User selected model
@@ -13,6 +14,12 @@ class AgentManager {
         this.currentStreamingElement = null;  // Track streaming message element
         this.currentEventSource = null;  // Track EventSource for cancellation
         this.currentAbortController = null;  // For stopping streaming
+
+        this.STORAGE_KEY = 'quasar_chat_history';
+        this.MAX_HISTORY_SESSIONS = 20; // Keep last 20 conversations
+        this.currentSessionId = Date.now().toString();
+
+        this.toolState = new Map(); // Track state between tool_start and tool_complete
     }
 
     /**
@@ -23,6 +30,41 @@ class AgentManager {
         this.autoResizeTextarea();
         this.updateModelSelectionUI();
         this.loadAvailableModels();
+        this.loadChatHistory();
+        this.configureMarkdown();
+    }
+
+    /**
+     * Configure marked.js for markdown parsing
+     */
+    configureMarkdown() {
+        if (!window.marked) return;
+
+        const renderer = new marked.Renderer();
+
+        // Custom code block renderer with copy button
+        renderer.code = (code, language) => {
+            const validLanguage = hljs.getLanguage(language) ? language : 'plaintext';
+            const highlighted = hljs.highlight(code, { language: validLanguage }).value;
+
+            return `
+                <pre><div class="code-copy-btn" title="Copy code"><i data-lucide="copy"></i><span>Copy</span></div><code class="hljs language-${validLanguage}">${highlighted}</code></pre>
+            `;
+        };
+
+        marked.setOptions({
+            renderer: renderer,
+            highlight: (code, lang) => {
+                if (window.hljs && hljs.getLanguage(lang)) {
+                    return hljs.highlight(code, { language: lang }).value;
+                }
+                return code;
+            },
+            headerIds: false,
+            mangle: false,
+            breaks: true, // Support GFM-style breaks
+            sanitize: false // We escape input before passing to marked if needed, but marked handles it
+        });
     }
 
     /**
@@ -140,6 +182,9 @@ class AgentManager {
         // Create streaming message placeholder
         this.createStreamingMessage();
 
+        // Show thinking toast
+        this.thinkingToast = window.toast?.info('AI is thinking...', { duration: 0 });
+
         // Create abort controller for cancellation
         this.currentAbortController = new AbortController();
 
@@ -181,6 +226,11 @@ class AgentManager {
                             this.handleStreamEvent(data, currentContent, toolsUsed);
 
                             if (data.type === 'token' && data.content) {
+                                // Dismiss thinking toast on first token
+                                if (this.thinkingToast) {
+                                    window.toast?.dismiss(this.thinkingToast);
+                                    this.thinkingToast = null;
+                                }
                                 currentContent += data.content;
                                 this.updateStreamingMessage(currentContent);
                             } else if (data.type === 'tool_complete') {
@@ -312,17 +362,50 @@ class AgentManager {
                 break;
             case 'tool_start':
                 console.log(`🔧 Starting tool: ${data.tool}`);
-                this.showActionCard(data.tool, data.args || {}, 'running');
+                const cardId = this.showActionCard(data.tool, data.args || {}, 'running');
+
+                // For file-modifying tools, try to capture "before" state
+                const modificationTools = ['modify_file', 'patch_file', 'write_to_file', 'create_file'];
+                if (modificationTools.includes(data.tool)) {
+                    const filePath = data.args?.path || data.args?.file_path;
+                    if (filePath) {
+                        this.captureBeforeState(cardId, filePath);
+                    }
+                }
                 break;
             case 'tool_complete':
                 console.log(`✅ Tool complete: ${data.tool}`);
                 this.updateActionCard(data.tool, 'complete', data.result);
 
                 // Immediately refresh file tree for file-modifying tools
-                const fileTools = ['create_file', 'modify_file', 'delete_file', 'move_file'];
+                const fileTools = ['create_file', 'modify_file', 'delete_file', 'move_file', 'patch_file'];
                 if (fileTools.includes(data.tool) && window.fileTreeManager) {
                     console.log(`🔄 Refreshing file tree after ${data.tool}`);
                     window.fileTreeManager.loadFileTree();
+
+                    // Parse result if it's a string
+                    let result = data.result;
+                    if (typeof result === 'string') {
+                        try {
+                            result = JSON.parse(result);
+                        } catch (e) {
+                            console.log('⚠ Could not parse result:', e);
+                        }
+                    }
+
+                    // If a file was modified, reload it in the editor if it's open
+                    if (result && result.path && window.editorManager && window.fileTreeManager?.rootPath) {
+                        // Convert relative path to absolute
+                        let absolutePath = result.path;
+                        if (!absolutePath.includes(':\\') && !absolutePath.startsWith('/')) {
+                            // It's a relative path, make it absolute using Windows backslashes
+                            absolutePath = `${window.fileTreeManager.rootPath}\\${result.path}`;
+                        }
+                        console.log(`📝 Auto-reload triggered for: ${absolutePath}`);
+                        window.editorManager.reloadFile(absolutePath);
+                    } else {
+                        console.log(`⚠ No path to reload. result:`, result, 'rootPath:', window.fileTreeManager?.rootPath);
+                    }
                 }
                 break;
             case 'file_tree_updated':
@@ -444,21 +527,57 @@ class AgentManager {
     }
 
     /**
+     * Capture the "before" state of a file before a tool modifies it
+     */
+    async captureBeforeState(cardId, filePath) {
+        try {
+            // Check if open in editor first (faster, has unsaved changes)
+            let content = null;
+            if (window.editorManager) {
+                const openFiles = window.editorManager.openFiles;
+                // Try to find matching path
+                for (const [path, data] of openFiles.entries()) {
+                    if (path === filePath || path.endsWith(filePath) || filePath.endsWith(path)) {
+                        content = data.model.getValue();
+                        break;
+                    }
+                }
+            }
+
+            // If not in editor, fetch from API
+            if (content === null) {
+                const response = await fetch(`${CONFIG.API_BASE_URL}/files/read?path=${encodeURIComponent(filePath)}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    content = data.content;
+                }
+            }
+
+            if (content !== null) {
+                this.toolState.set(cardId, { beforeContent: content, filePath });
+            }
+        } catch (error) {
+            console.warn('Failed to capture before state:', error);
+        }
+    }
+
+    /**
      * Show styled action card for tool execution
      */
     showActionCard(toolName, args, status) {
-        if (!this.currentStreamingElement) return;
+        if (!this.currentStreamingElement) return null;
 
         const contentEl = this.currentStreamingElement.querySelector('.message-content');
-        if (!contentEl) return;
+        if (!contentEl) return null;
 
         const info = this.getToolDisplayInfo(toolName, args);
         const detail = info.getDetail(args);
+        const cardId = `action-${toolName}-${Date.now()}`;
 
         // Create action card
         const card = document.createElement('div');
         card.className = `action-card action-card-${status}`;
-        card.id = `action-${toolName}-${Date.now()}`;
+        card.id = cardId;
         card.dataset.tool = toolName;
 
         if (info.isCommand) {
@@ -500,7 +619,11 @@ class AgentManager {
 
         // Auto-scroll
         const messagesContainer = document.getElementById('chatMessages');
-        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        if (messagesContainer) {
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        return cardId;
     }
 
     /**
@@ -523,6 +646,46 @@ class AgentManager {
             } else if (status === 'error') {
                 statusBadge.textContent = '✗';
                 statusBadge.className = 'action-status-badge error';
+            }
+        }
+
+        // Handle diff display for file modifications
+        const toolInfo = this.toolState.get(card.id);
+        if (status === 'complete' && toolInfo && window.diffViewer) {
+            let afterContent = null;
+
+            // Extract afterContent from result if possible
+            if (result) {
+                let parsedResult = result;
+                if (typeof result === 'string' && (result.startsWith('{') || result.startsWith('['))) {
+                    try { parsedResult = JSON.parse(result); } catch (e) { }
+                }
+
+                if (parsedResult.content) afterContent = parsedResult.content;
+                else if (typeof parsedResult === 'string' && toolName === 'read_file') afterContent = parsedResult;
+            }
+
+            if (afterContent !== null && afterContent !== toolInfo.beforeContent) {
+                const diffBtn = document.createElement('button');
+                diffBtn.className = 'btn-show-diff';
+                diffBtn.innerHTML = '<i data-lucide="diff"></i><span>Show Changes</span>';
+                card.appendChild(diffBtn);
+
+                if (window.lucide) lucide.createIcons();
+
+                let diffContainer = null;
+                diffBtn.addEventListener('click', () => {
+                    if (diffContainer) {
+                        diffContainer.style.display = diffContainer.style.display === 'none' ? 'block' : 'none';
+                        diffBtn.querySelector('span').textContent = diffContainer.style.display === 'none' ? 'Show Changes' : 'Hide Changes';
+                        return;
+                    }
+
+                    diffContainer = document.createElement('div');
+                    diffContainer.innerHTML = window.diffViewer.renderLineDiff(toolInfo.beforeContent, afterContent, toolInfo.filePath);
+                    card.appendChild(diffContainer);
+                    diffBtn.querySelector('span').textContent = 'Hide Changes';
+                });
             }
         }
 
@@ -806,19 +969,50 @@ How can I help you today?`;
 
         messagesContainer.appendChild(messageDiv);
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+        // Auto-save chat history
+        this.saveChatHistory();
     }
 
     /**
-     * Format message content (basic markdown)
+     * Format message content (Advanced markdown with syntax highlighting)
      */
     formatMessage(content) {
+        if (!content) return '';
+
+        if (window.marked) {
+            try {
+                // Use marked for high-fidelity parsing
+                const html = marked.parse(content);
+
+                // After parsing, we might need to re-initialize Lucide icons in the generated HTML
+                // (e.g. for the copy button icons)
+                setTimeout(() => {
+                    if (window.lucide) lucide.createIcons();
+                    this.attachCodeCopyHandlers();
+                }, 0);
+
+                return html;
+            } catch (error) {
+                console.error('Markdown parsing error:', error);
+                return this.fallbackFormatMessage(content);
+            }
+        }
+
+        return this.fallbackFormatMessage(content);
+    }
+
+    /**
+     * Fallback formatter if marked.js is not loaded
+     */
+    fallbackFormatMessage(content) {
         // Escape HTML
         let formatted = content
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
 
-        // Code blocks
+        // Basic Code blocks
         formatted = formatted.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
             return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
         });
@@ -826,24 +1020,43 @@ How can I help you today?`;
         // Inline code
         formatted = formatted.replace(/`([^`]+)`/g, '<code>$1</code>');
 
-        // Bold
+        // Bold/Italic
         formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-
-        // Italic
         formatted = formatted.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-
-        // Headers
-        formatted = formatted.replace(/^### (.+)$/gm, '<h4>$1</h4>');
-        formatted = formatted.replace(/^## (.+)$/gm, '<h3>$1</h3>');
-
-        // Lists
-        formatted = formatted.replace(/^- (.+)$/gm, '<li>$1</li>');
-        formatted = formatted.replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>');
 
         // Line breaks
         formatted = formatted.replace(/\n/g, '<br>');
 
         return formatted;
+    }
+
+    /**
+     * Attach click handlers to dynamically created copy buttons in messages
+     */
+    attachCodeCopyHandlers() {
+        const containers = document.querySelectorAll('.message-content pre');
+        containers.forEach(pre => {
+            const btn = pre.querySelector('.code-copy-btn');
+            const codeEl = pre.querySelector('code');
+
+            if (btn && codeEl && !btn.dataset.handlerAttached) {
+                btn.dataset.handlerAttached = 'true';
+                btn.addEventListener('click', () => {
+                    const code = codeEl.innerText;
+                    navigator.clipboard.writeText(code).then(() => {
+                        btn.classList.add('copied');
+                        btn.innerHTML = '<i data-lucide="check"></i><span>Copied!</span>';
+                        lucide.createIcons();
+
+                        setTimeout(() => {
+                            btn.classList.remove('copied');
+                            btn.innerHTML = '<i data-lucide="copy"></i><span>Copy</span>';
+                            lucide.createIcons();
+                        }, 2000);
+                    });
+                });
+            }
+        });
     }
 
     /**
@@ -976,6 +1189,41 @@ How can I help you today?`;
             const dropdown = document.getElementById('modelDropdown');
             if (dropdown) dropdown.style.display = 'none';
         });
+
+        // New Chat button
+        const newChatBtn = document.getElementById('newChatBtn');
+        newChatBtn?.addEventListener('click', () => {
+            this.startNewSession();
+        });
+
+        // Chat History button
+        const chatHistoryBtn = document.getElementById('chatHistoryBtn');
+        chatHistoryBtn?.addEventListener('click', () => {
+            this.showHistoryModal();
+        });
+
+        // Close history modal
+        const closeHistoryBtn = document.getElementById('closeChatHistoryBtn');
+        closeHistoryBtn?.addEventListener('click', () => {
+            this.hideHistoryModal();
+        });
+
+        // Clear all history button
+        const clearHistoryBtn = document.getElementById('clearHistoryBtn');
+        clearHistoryBtn?.addEventListener('click', () => {
+            if (confirm('Clear all chat history? This cannot be undone.')) {
+                this.clearAllHistory();
+                this.hideHistoryModal();
+            }
+        });
+
+        // Close modal on overlay click
+        const historyModal = document.getElementById('chatHistoryModal');
+        historyModal?.addEventListener('click', (e) => {
+            if (e.target === historyModal) {
+                this.hideHistoryModal();
+            }
+        });
     }
 
     /**
@@ -1106,6 +1354,235 @@ How can I help you today?`;
         if (displayEl) {
             displayEl.textContent = this.selectedModel;
         }
+    }
+
+    // ==========================================
+    // Chat History Persistence Methods
+    // ==========================================
+
+    /**
+     * Load chat history from localStorage
+     */
+    loadChatHistory() {
+        try {
+            const stored = localStorage.getItem(this.STORAGE_KEY);
+            if (stored) {
+                this.chatHistory = JSON.parse(stored);
+                console.log(`📚 Loaded ${this.chatHistory.length} chat sessions from history`);
+            }
+        } catch (error) {
+            console.error('Failed to load chat history:', error);
+            this.chatHistory = [];
+        }
+    }
+
+    /**
+     * Save current messages to chat history
+     */
+    saveChatHistory() {
+        if (this.messages.length === 0) return;
+
+        try {
+            // Find or create current session
+            let sessionIndex = this.chatHistory.findIndex(s => s.id === this.currentSessionId);
+
+            const session = {
+                id: this.currentSessionId,
+                timestamp: new Date().toISOString(),
+                messages: this.messages.map(m => ({
+                    role: m.role,
+                    content: m.content,
+                    timestamp: m.timestamp?.toISOString() || new Date().toISOString()
+                })),
+                // Create a title from first user message
+                title: this.getSessionTitle()
+            };
+
+            if (sessionIndex >= 0) {
+                // Update existing session
+                this.chatHistory[sessionIndex] = session;
+            } else {
+                // Add new session
+                this.chatHistory.unshift(session);
+
+                // Trim to max sessions
+                if (this.chatHistory.length > this.MAX_HISTORY_SESSIONS) {
+                    this.chatHistory = this.chatHistory.slice(0, this.MAX_HISTORY_SESSIONS);
+                }
+            }
+
+            localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.chatHistory));
+            console.log('💾 Chat saved to history');
+        } catch (error) {
+            console.error('Failed to save chat history:', error);
+        }
+    }
+
+    /**
+     * Get session title from first user message
+     */
+    getSessionTitle() {
+        const firstUserMsg = this.messages.find(m => m.role === 'user');
+        if (firstUserMsg) {
+            const title = firstUserMsg.content.substring(0, 50);
+            return title.length < firstUserMsg.content.length ? title + '...' : title;
+        }
+        return 'New Chat';
+    }
+
+    /**
+     * Restore a previous chat session
+     */
+    restoreSession(sessionId) {
+        const session = this.chatHistory.find(s => s.id === sessionId);
+        if (!session) {
+            console.error('Session not found:', sessionId);
+            return;
+        }
+
+        // Clear current chat UI
+        const messagesContainer = document.getElementById('chatMessages');
+        messagesContainer.innerHTML = '';
+
+        // Restore messages
+        this.messages = [];
+        this.currentSessionId = session.id;
+
+        session.messages.forEach(msg => {
+            this.addMessage(msg.role, msg.content);
+        });
+
+        console.log(`📖 Restored session: ${session.title}`);
+    }
+
+    /**
+     * Start a new chat session
+     */
+    startNewSession() {
+        // Save current session first
+        this.saveChatHistory();
+
+        // Clear current chat
+        this.messages = [];
+        this.currentSessionId = Date.now().toString();
+
+        // Clear UI
+        const messagesContainer = document.getElementById('chatMessages');
+        messagesContainer.innerHTML = `
+            <div class="welcome-message">
+                <h3>👋 Hello! I'm your AI coding assistant.</h3>
+                <p>I can help you with:</p>
+                <ul>
+                    <li>📝 Writing and editing code</li>
+                    <li>🐛 Debugging and fixing issues</li>
+                    <li>💡 Explaining code concepts</li>
+                    <li>🚀 Running terminal commands</li>
+                </ul>
+                <p>Open a folder to get started, then ask me anything!</p>
+            </div>
+        `;
+
+        console.log('🆕 Started new chat session');
+    }
+
+    /**
+     * Clear all chat history
+     */
+    clearAllHistory() {
+        this.chatHistory = [];
+        localStorage.removeItem(this.STORAGE_KEY);
+        console.log('🗑️ Cleared all chat history');
+    }
+
+    /**
+     * Get chat history for display
+     */
+    getChatHistory() {
+        return this.chatHistory.map(session => ({
+            id: session.id,
+            title: session.title,
+            timestamp: session.timestamp,
+            messageCount: session.messages.length
+        }));
+    }
+
+    /**
+     * Show chat history modal
+     */
+    showHistoryModal() {
+        const modal = document.getElementById('chatHistoryModal');
+        if (modal) {
+            modal.classList.add('active');
+            this.renderHistoryList();
+            // Re-init lucide icons
+            if (typeof lucide !== 'undefined') {
+                lucide.createIcons();
+            }
+        }
+    }
+
+    /**
+     * Hide chat history modal
+     */
+    hideHistoryModal() {
+        const modal = document.getElementById('chatHistoryModal');
+        if (modal) {
+            modal.classList.remove('active');
+        }
+    }
+
+    /**
+     * Render chat history list in modal
+     */
+    renderHistoryList() {
+        const listEl = document.getElementById('historyList');
+        if (!listEl) return;
+
+        const history = this.getChatHistory();
+
+        if (history.length === 0) {
+            listEl.innerHTML = `
+                <div class="history-empty">
+                    <i data-lucide="message-circle"></i>
+                    <p>No chat history yet</p>
+                    <span>Your conversations will appear here</span>
+                </div>
+            `;
+            return;
+        }
+
+        listEl.innerHTML = history.map(session => {
+            const date = new Date(session.timestamp);
+            const dateStr = date.toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+            const isCurrent = session.id === this.currentSessionId;
+
+            return `
+                <div class="history-item ${isCurrent ? 'current' : ''}" data-session-id="${session.id}">
+                    <div class="history-item-content">
+                        <div class="history-title">${this.escapeHtml(session.title)}</div>
+                        <div class="history-meta">
+                            <span class="history-date">${dateStr}</span>
+                            <span class="history-count">${session.messageCount} messages</span>
+                        </div>
+                    </div>
+                    ${isCurrent ? '<span class="current-badge">Current</span>' : ''}
+                </div>
+            `;
+        }).join('');
+
+        // Add click handlers
+        listEl.querySelectorAll('.history-item:not(.current)').forEach(item => {
+            item.addEventListener('click', () => {
+                const sessionId = item.dataset.sessionId;
+                this.restoreSession(sessionId);
+                this.hideHistoryModal();
+            });
+        });
     }
 }
 

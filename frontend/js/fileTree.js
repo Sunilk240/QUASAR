@@ -154,22 +154,25 @@ class FileTreeManager {
             this.render();
 
             console.log('✅ Opened folder:', this.rootPath);
+            window.toast?.success(`Opened folder: ${this.rootPath.split(/[\\/]/).pop()}`);
 
             // Save to persistence
             this.saveToPersistence(this.rootPath);
 
             // Reconnect terminal to use the new workspace path
             if (window.terminalManager) {
-                window.terminalManager.connectWebSocket();
+                // Change directory in all terminals to the new workspace
+                window.terminalManager.terminals.forEach((data, id) => {
+                    window.terminalManager.changeDirectory(this.rootPath, id);
+                });
             }
 
         } catch (error) {
             console.error('Failed to open folder:', error);
+            window.toast?.error(`Failed to open folder: ${error.message}`);
             // If auto-loading failed, show placeholder or error
             if (!this.rootPath) {
                 this.showError('Could not open folder. ' + error.message);
-            } else {
-                alert('Error: ' + error.message);
             }
         }
     }
@@ -296,21 +299,22 @@ class FileTreeManager {
             const isExpanded = this.expandedFolders.has(item.path);
             const icon = this.getItemIcon(item);
             const languageClass = this.getLanguageClass(item.name);
+            const iconColorClass = this.getIconColorClass(item);
 
             html += `
                 <div class="tree-item ${isFolder ? 'folder' : 'file'} ${languageClass}" 
                      data-path="${item.path}"
                      data-type="${item.type}"
                      style="--indent-level: ${level}">
-                    ${isFolder ? `<i data-lucide="${isExpanded ? 'chevron-down' : 'chevron-right'}" class="tree-chevron"></i>` : '<span style="width: 16px; display: inline-block;"></span>'}
-                    <i data-lucide="${icon}"></i>
+                    ${isFolder ? `<i data-lucide="${isExpanded ? 'chevron-down' : 'chevron-right'}" class="tree-chevron folder-arrow"></i>` : '<span style="width: 16px; display: inline-block;"></span>'}
+                    <span class="file-icon ${iconColorClass}"><i data-lucide="${icon}"></i></span>
                     <span class="tree-item-name">${item.name}</span>
                 </div>
             `;
 
             // Render children if folder is expanded
             if (isFolder && isExpanded && item.children) {
-                html += `<div class="tree-children">${this.renderItems(item.children, level + 1)}</div>`;
+                html += `<div class="tree-children folder-children ${isExpanded ? 'expanded' : 'collapsed'}">${this.renderItems(item.children, level + 1)}</div>`;
             }
         }
 
@@ -342,6 +346,41 @@ class FileTreeManager {
             'md': 'markdown'
         };
         return classMap[ext] || '';
+    }
+
+    /**
+     * Get icon color class based on file type
+     */
+    getIconColorClass(item) {
+        if (item.type === 'folder') {
+            return this.expandedFolders.has(item.path) ? 'folder-open' : 'folder';
+        }
+
+        const filename = item.name.toLowerCase();
+        const ext = filename.split('.').pop();
+
+        // Special files
+        if (filename === '.gitignore' || filename === '.git') return 'git';
+        if (filename === '.env' || filename.startsWith('.env')) return 'env';
+
+        // Extension mapping
+        const colorMap = {
+            'py': 'python',
+            'js': 'javascript',
+            'jsx': 'javascript',
+            'ts': 'typescript',
+            'tsx': 'typescript',
+            'html': 'html',
+            'htm': 'html',
+            'css': 'css',
+            'scss': 'css',
+            'json': 'json',
+            'md': 'markdown',
+            'yml': 'json',
+            'yaml': 'json'
+        };
+
+        return colorMap[ext] || 'default';
     }
 
     /**
@@ -845,6 +884,78 @@ dist/
                 this.handleConfirmFolder();
             }
         });
+    }
+
+    /**
+     * Create a new file
+     */
+    async createNewFile(parentPath = null) {
+        if (!this.rootPath) {
+            alert('Please open a folder first');
+            return;
+        }
+
+        const fileName = prompt('Enter file name:');
+        if (!fileName) return;
+
+        const basePath = parentPath || this.rootPath;
+        const fullPath = `${basePath}/${fileName}`;
+
+        try {
+            const response = await fetch(`${CONFIG.API_BASE_URL}/files/create`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    path: fullPath,
+                    is_folder: false
+                })
+            });
+
+            if (!response.ok) throw new Error('Failed to create file');
+
+            console.log('✅ Created file:', fullPath);
+            window.toast?.success(`File created: ${fileName}`);
+            this.loadFileTree();
+        } catch (error) {
+            console.error('Failed to create file:', error);
+            window.toast?.error(`Failed to create file: ${error.message}`);
+        }
+    }
+
+    /**
+     * Create a new folder
+     */
+    async createNewFolder(parentPath = null) {
+        if (!this.rootPath) {
+            alert('Please open a folder first');
+            return;
+        }
+
+        const folderName = prompt('Enter folder name:');
+        if (!folderName) return;
+
+        const basePath = parentPath || this.rootPath;
+        const fullPath = `${basePath}/${folderName}`;
+
+        try {
+            const response = await fetch(`${CONFIG.API_BASE_URL}/files/create`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    path: fullPath,
+                    is_folder: true
+                })
+            });
+
+            if (!response.ok) throw new Error('Failed to create folder');
+
+            console.log('✅ Created folder:', fullPath);
+            window.toast?.success(`Folder created: ${folderName}`);
+            this.loadFileTree();
+        } catch (error) {
+            console.error('Failed to create folder:', error);
+            window.toast?.error(`Failed to create folder: ${error.message}`);
+        }
     }
 
     /**
