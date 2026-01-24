@@ -6,7 +6,6 @@
 class App {
     constructor() {
         this.initialized = false;
-        this.theme = 'dark';
     }
 
     /**
@@ -23,6 +22,10 @@ class App {
             console.log('📝 Loading Monaco Editor...');
             await window.editorManager.init();
             console.log('✅ Monaco Editor ready');
+
+            // Initialize Settings after Monaco so they can be applied
+            console.log('⚙️ Initializing Settings...');
+            window.settingsManager.init();
 
             // Initialize Terminal
             console.log('🖥️ Initializing Terminal...');
@@ -44,6 +47,11 @@ class App {
             window.resizerManager.init();
             console.log('✅ Resizers ready');
 
+            // Initialize Quick Box
+            console.log('🔍 Initializing Quick Box...');
+            window.quickBoxManager.init();
+            console.log('✅ Quick Box ready');
+
             // Setup global event listeners
             this.setupEventListeners();
 
@@ -51,9 +59,6 @@ class App {
             if (window.lucide) {
                 lucide.createIcons();
             }
-
-            // Load saved theme
-            this.loadTheme();
 
             // Mark as initialized
             this.initialized = true;
@@ -84,15 +89,10 @@ class App {
             this.runCurrentFile();
         });
 
-        // Theme toggle
-        document.getElementById('themeToggle')?.addEventListener('click', () => {
-            this.toggleTheme();
-        });
-
         // Keyboard shortcuts
         document.addEventListener('keydown', (e) => {
-            // Prevent browser defaults for our shortcuts
-            if (e.ctrlKey && ['s', 'r', 'k', 'b', 'j', '/'].includes(e.key)) {
+            // Prevent browser defaults for our shortcuts (Save, Run, Command Palette, Search, File Tree, Terminal, Agent)
+            if (e.ctrlKey && ['s', 'r', 'k', 'p', 'b', 'j', '/'].includes(e.key)) {
                 e.preventDefault();
             }
         });
@@ -119,15 +119,11 @@ class App {
         const fileData = await window.editorManager?.saveFile();
 
         if (fileData) {
-            // TODO: Send to backend API
             console.log('Saving file:', fileData.path);
-
             window.terminalManager?.writeSuccess(`✓ Saved: ${fileData.path}`);
-
-            // Show toast notification
-            this.showToast('File saved successfully');
         } else {
             window.terminalManager?.writeWarning('⚠ No file to save');
+            window.toast?.warning('No file to save');
         }
     }
 
@@ -144,7 +140,6 @@ class App {
         }
 
         const filePath = editor.getActiveFilePath();
-        const fileName = filePath.split(/[\\/]/).pop();
         const language = detectLanguage(filePath);
 
         // Check if language is supported
@@ -169,38 +164,6 @@ class App {
         terminal?.runCommand(command);
 
         console.log('▶ Running:', command);
-    }
-
-    /**
-     * Toggle theme
-     */
-    toggleTheme() {
-        this.theme = this.theme === 'dark' ? 'light' : 'dark';
-        document.documentElement.setAttribute('data-theme', this.theme);
-
-        // Update Monaco theme
-        window.editorManager?.setTheme(this.theme === 'dark' ? 'vs-dark' : 'vs');
-
-        // Update toggle button icon
-        const btn = document.getElementById('themeToggle');
-        const icon = btn?.querySelector('[data-lucide]');
-        if (icon) {
-            icon.setAttribute('data-lucide', this.theme === 'dark' ? 'moon' : 'sun');
-            lucide.createIcons();
-        }
-
-        // Save preference
-        localStorage.setItem('theme', this.theme);
-    }
-
-    /**
-     * Load saved theme
-     */
-    loadTheme() {
-        const saved = localStorage.getItem('theme');
-        if (saved && saved !== this.theme) {
-            this.toggleTheme();
-        }
     }
 
     /**
@@ -238,7 +201,6 @@ class App {
      * Show loading state
      */
     showLoading(show) {
-        // Could add a loading overlay here if needed
         if (show) {
             document.body.style.cursor = 'wait';
         } else {
@@ -252,56 +214,11 @@ class App {
     showError(message) {
         console.error(message);
         window.terminalManager?.writeError(message);
-    }
-
-    /**
-     * Show toast notification
-     */
-    showToast(message, duration = 3000) {
-        // Remove existing toast
-        document.querySelector('.toast')?.remove();
-
-        const toast = document.createElement('div');
-        toast.className = 'toast';
-        toast.textContent = message;
-        toast.style.cssText = `
-            position: fixed;
-            bottom: 50px;
-            left: 50%;
-            transform: translateX(-50%);
-            padding: 10px 20px;
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            font-size: 13px;
-            z-index: 1000;
-            animation: fadeInUp 0.2s ease;
-        `;
-
-        document.body.appendChild(toast);
-
-        setTimeout(() => {
-            toast.style.animation = 'fadeOut 0.2s ease';
-            setTimeout(() => toast.remove(), 200);
-        }, duration);
+        window.toast?.error(message);
     }
 }
 
-// Add toast animation styles
-const toastStyles = document.createElement('style');
-toastStyles.textContent = `
-    @keyframes fadeInUp {
-        from { opacity: 0; transform: translate(-50%, 10px); }
-        to { opacity: 1; transform: translate(-50%, 0); }
-    }
-    @keyframes fadeOut {
-        from { opacity: 1; }
-        to { opacity: 0; }
-    }
-`;
-document.head.appendChild(toastStyles);
-
 // Create and initialize app
 const app = new App();
+window.App = app; // Expose globally for Quick Box
 document.addEventListener('DOMContentLoaded', () => app.init());
