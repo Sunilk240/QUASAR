@@ -8,6 +8,7 @@ class AgentManager {
         this.messages = [];
         this.chatHistory = []; // Store conversation sessions
         this.isLoading = false;
+        this.isStreaming = false;  // Track if currently streaming (for button toggle)
         this.currentModel = 'auto'; // Model being used by AI (indicator)
         this.selectedModel = localStorage.getItem('quasar_selected_model') || 'Auto'; // User selected model
         this.streamingEnabled = true;  // Enable streaming by default
@@ -34,26 +35,26 @@ class AgentManager {
         this.configureMarkdown();
     }
 
-    /**
-     * Configure marked.js for markdown parsing
-     */
     configureMarkdown() {
         if (!window.marked) return;
 
-        const renderer = new marked.Renderer();
+        const codeRenderer = (codeOrToken, language) => {
+            let code, lang;
+            if (typeof codeOrToken === 'object' && codeOrToken !== null) {
+                code = codeOrToken.text || '';
+                lang = codeOrToken.lang || '';
+            } else {
+                code = codeOrToken || '';
+                lang = language || '';
+            }
 
-        // Custom code block renderer with copy button
-        renderer.code = (code, language) => {
-            const validLanguage = hljs.getLanguage(language) ? language : 'plaintext';
-            const highlighted = hljs.highlight(code, { language: validLanguage }).value;
+            const validLanguage = (window.hljs && hljs.getLanguage(lang)) ? lang : 'plaintext';
+            const highlighted = (window.hljs && code) ? hljs.highlight(code, { language: validLanguage }).value : code;
 
-            return `
-                <pre><div class="code-copy-btn" title="Copy code"><i data-lucide="copy"></i><span>Copy</span></div><code class="hljs language-${validLanguage}">${highlighted}</code></pre>
-            `;
+            return `<pre style="position: relative;"><div class="code-copy-btn" title="Copy code" style="opacity: 0.8 !important;"><i data-lucide="copy"></i></div><code class="hljs language-${validLanguage}">${highlighted}</code></pre>`;
         };
 
-        marked.setOptions({
-            renderer: renderer,
+        const options = {
             highlight: (code, lang) => {
                 if (window.hljs && hljs.getLanguage(lang)) {
                     return hljs.highlight(code, { language: lang }).value;
@@ -62,9 +63,25 @@ class AgentManager {
             },
             headerIds: false,
             mangle: false,
-            breaks: true, // Support GFM-style breaks
-            sanitize: false // We escape input before passing to marked if needed, but marked handles it
-        });
+            breaks: true,
+            sanitize: false
+        };
+
+        // Modern marked (v4+) uses marked.use()
+        if (typeof marked.use === 'function') {
+            marked.use({
+                renderer: {
+                    code: codeRenderer
+                }
+            });
+        }
+
+        // Fallback for older versions or additional options
+        const renderer = new marked.Renderer();
+        renderer.code = codeRenderer;
+        options.renderer = renderer;
+
+        marked.setOptions(options);
     }
 
     /**
@@ -188,11 +205,23 @@ class AgentManager {
         // Create abort controller for cancellation
         this.currentAbortController = new AbortController();
 
+        // Set streaming state and update button
+        this.isStreaming = true;
+        this.updateSendButton();
+
         try {
+            // Get user API keys from settings
+            const apiKeys = window.settingsManager?.getApiKeys() || {};
+
             const response = await fetch(`${baseUrl}/api/agent/chat/stream`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'X-Groq-Api-Keys': JSON.stringify(apiKeys.groq || []),
+                    'X-OpenAI-Api-Keys': JSON.stringify(apiKeys.openai || []),
+                    'X-Anthropic-Api-Keys': JSON.stringify(apiKeys.anthropic || []),
+                    'X-Cerebras-Api-Keys': JSON.stringify(apiKeys.cerebras || []),
+                    'X-Ollama-Url': apiKeys.ollamaUrl || ''
                 },
                 body: JSON.stringify(body),
                 signal: this.currentAbortController.signal
@@ -256,9 +285,19 @@ class AgentManager {
                     }
                 }
             }
+
+            // Handle case where stream ends without 'done' event
+            if (this.isStreaming) {
+                this.finalizeStreamingMessage(currentContent);
+            }
         } catch (error) {
             console.error('Streaming error:', error);
-            this.finalizeStreamingMessage(`Error: ${error.message}`);
+            if (this.isStreaming) {
+                this.finalizeStreamingMessage(`Error: ${error.message}`);
+            }
+        } finally {
+            this.isStreaming = false;
+            this.updateSendButton();
         }
     }
 
@@ -275,21 +314,12 @@ class AgentManager {
         messageDiv.className = 'chat-message assistant streaming';
         messageDiv.id = 'streamingMessage';
         messageDiv.innerHTML = `
-            <div class="streaming-actions">
-                <button class="stop-streaming-btn" title="Stop generating">
-                    ⏹ Stop
-                </button>
-            </div>
             <div class="message-content streaming-content">
                 <span class="streaming-cursor">▊</span>
             </div>
         `;
         messagesContainer.appendChild(messageDiv);
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
-
-        // Add stop button handler
-        const stopBtn = messageDiv.querySelector('.stop-streaming-btn');
-        stopBtn.addEventListener('click', () => this.stopStreaming());
 
         // Remove typing indicator if present
         document.getElementById('typingIndicator')?.remove();
@@ -313,6 +343,29 @@ class AgentManager {
                 this.finalizeStreamingMessage(currentText + '\n\n[Stopped by user]');
             }
         }
+        this.isStreaming = false;
+        this.updateSendButton();
+    }
+
+    /**
+     * Update send button appearance based on streaming state
+     */
+    updateSendButton() {
+        const btn = document.getElementById('sendBtn');
+        if (!btn) return;
+
+        if (this.isStreaming) {
+            btn.innerHTML = '<i data-lucide="square"></i>';
+            btn.title = 'Stop';
+            btn.classList.add('stop-mode');
+            // Ensure button is enabled for stopping even if setLoading(true) disabled it
+            btn.disabled = false;
+        } else {
+            btn.innerHTML = '<i data-lucide="send"></i>';
+            btn.title = 'Send';
+            btn.classList.remove('stop-mode');
+        }
+        if (window.lucide) lucide.createIcons();
     }
 
     /**
@@ -353,7 +406,14 @@ class AgentManager {
                 console.log(`📋 Task: ${data.task_type} (confidence: ${data.confidence})`);
                 break;
             case 'iteration':
-                console.log(`🔄 Iteration ${data.current}/${data.max}`);
+                console.log(`🔄 Iteration ${data.current}/${data.max} (${data.remaining} remaining)`);
+                break;
+            case 'iteration_warning':
+                console.log(`⚠️ Iteration warning: ${data.message}`);
+                // Show toast warning
+                if (window.toast) {
+                    window.toast.warning(`⚠️ Last tool iteration! Agent will summarize progress.`);
+                }
                 break;
             case 'message':
                 // Display narrative message inline
@@ -364,18 +424,30 @@ class AgentManager {
                 console.log(`🔧 Starting tool: ${data.tool}`);
                 const cardId = this.showActionCard(data.tool, data.args || {}, 'running');
 
-                // For file-modifying tools, try to capture "before" state
+                // For file-modifying tools, try to capture "before" state (must await)
                 const modificationTools = ['modify_file', 'patch_file', 'write_to_file', 'create_file'];
                 if (modificationTools.includes(data.tool)) {
                     const filePath = data.args?.path || data.args?.file_path;
-                    if (filePath) {
-                        this.captureBeforeState(cardId, filePath);
+                    if (filePath && cardId) {
+                        // Capture before state immediately (don't await to avoid blocking stream)
+                        this.captureBeforeState(cardId, filePath).catch(err => console.warn('captureBeforeState error:', err));
                     }
                 }
                 break;
             case 'tool_complete':
                 console.log(`✅ Tool complete: ${data.tool}`);
                 this.updateActionCard(data.tool, 'complete', data.result);
+
+                // Special handling for suggest_command - render as copyable command
+                if (data.tool === 'suggest_command') {
+                    let result = data.result;
+                    if (typeof result === 'string') {
+                        try { result = JSON.parse(result); } catch (e) { }
+                    }
+                    if (result && result.command) {
+                        this.appendSuggestedCommand(result.command, result.description);
+                    }
+                }
 
                 // Immediately refresh file tree for file-modifying tools
                 const fileTools = ['create_file', 'modify_file', 'delete_file', 'move_file', 'patch_file'];
@@ -403,6 +475,11 @@ class AgentManager {
                         }
                         console.log(`📝 Auto-reload triggered for: ${absolutePath}`);
                         window.editorManager.reloadFile(absolutePath);
+
+                        // Mark new files with badge
+                        if (data.tool === 'create_file') {
+                            window.fileTreeManager.markAsNew(result.path);
+                        }
                     } else {
                         console.log(`⚠ No path to reload. result:`, result, 'rootPath:', window.fileTreeManager?.rootPath);
                     }
@@ -442,6 +519,52 @@ class AgentManager {
             } else {
                 contentEl.appendChild(narrativeEl);
             }
+
+            // Auto-scroll
+            const messagesContainer = document.getElementById('chatMessages');
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+    }
+
+    /**
+     * Append a suggested command block with copy button
+     */
+    appendSuggestedCommand(command, description = '') {
+        if (!this.currentStreamingElement) return;
+
+        const contentEl = this.currentStreamingElement.querySelector('.message-content');
+        if (contentEl) {
+            const commandId = `cmd-${Date.now()}`;
+            const commandEl = document.createElement('div');
+            commandEl.className = 'suggested-command-block';
+            commandEl.innerHTML = `
+                <div class="suggested-command-header">
+                    <span class="suggested-command-label">
+                        <i data-lucide="terminal"></i>
+                        ${description || 'Run in terminal'}
+                    </span>
+                    <button class="copy-command-btn" data-command="${this.escapeHtml(command)}" title="Copy command">
+                        <i data-lucide="copy"></i>
+                        <span>Copy</span>
+                    </button>
+                </div>
+                <pre class="suggested-command-code"><code>${this.escapeHtml(command)}</code></pre>
+            `;
+
+            // Add click handler for copy button
+            const copyBtn = commandEl.querySelector('.copy-command-btn');
+            copyBtn.addEventListener('click', () => {
+                navigator.clipboard.writeText(command);
+                copyBtn.innerHTML = '<i data-lucide="check"></i><span>Copied!</span>';
+                if (window.lucide) lucide.createIcons();
+                setTimeout(() => {
+                    copyBtn.innerHTML = '<i data-lucide="copy"></i><span>Copy</span>';
+                    if (window.lucide) lucide.createIcons();
+                }, 2000);
+            });
+
+            contentEl.appendChild(commandEl);
+            if (window.lucide) lucide.createIcons();
 
             // Auto-scroll
             const messagesContainer = document.getElementById('chatMessages');
@@ -652,41 +775,8 @@ class AgentManager {
         // Handle diff display for file modifications
         const toolInfo = this.toolState.get(card.id);
         if (status === 'complete' && toolInfo && window.diffViewer) {
-            let afterContent = null;
-
-            // Extract afterContent from result if possible
-            if (result) {
-                let parsedResult = result;
-                if (typeof result === 'string' && (result.startsWith('{') || result.startsWith('['))) {
-                    try { parsedResult = JSON.parse(result); } catch (e) { }
-                }
-
-                if (parsedResult.content) afterContent = parsedResult.content;
-                else if (typeof parsedResult === 'string' && toolName === 'read_file') afterContent = parsedResult;
-            }
-
-            if (afterContent !== null && afterContent !== toolInfo.beforeContent) {
-                const diffBtn = document.createElement('button');
-                diffBtn.className = 'btn-show-diff';
-                diffBtn.innerHTML = '<i data-lucide="diff"></i><span>Show Changes</span>';
-                card.appendChild(diffBtn);
-
-                if (window.lucide) lucide.createIcons();
-
-                let diffContainer = null;
-                diffBtn.addEventListener('click', () => {
-                    if (diffContainer) {
-                        diffContainer.style.display = diffContainer.style.display === 'none' ? 'block' : 'none';
-                        diffBtn.querySelector('span').textContent = diffContainer.style.display === 'none' ? 'Show Changes' : 'Hide Changes';
-                        return;
-                    }
-
-                    diffContainer = document.createElement('div');
-                    diffContainer.innerHTML = window.diffViewer.renderLineDiff(toolInfo.beforeContent, afterContent, toolInfo.filePath);
-                    card.appendChild(diffContainer);
-                    diffBtn.querySelector('span').textContent = 'Hide Changes';
-                });
-            }
+            // Try to get afterContent from result or fetch from API
+            this.getAfterContentAndShowDiff(card, toolInfo, result, toolName);
         }
 
         // Show command output if present
@@ -695,6 +785,60 @@ class AgentManager {
             outputEl.className = 'command-output';
             outputEl.innerHTML = `<pre>${this.escapeHtml(result.substring(0, 500))}</pre>`;
             card.appendChild(outputEl);
+        }
+    }
+
+    /**
+     * Get after content and show diff button
+     */
+    async getAfterContentAndShowDiff(card, toolInfo, result, toolName) {
+        let afterContent = null;
+
+        // Extract afterContent from result if possible
+        if (result) {
+            let parsedResult = result;
+            if (typeof result === 'string' && (result.startsWith('{') || result.startsWith('['))) {
+                try { parsedResult = JSON.parse(result); } catch (e) { }
+            }
+
+            if (parsedResult.content) afterContent = parsedResult.content;
+            else if (typeof parsedResult === 'string' && toolName === 'read_file') afterContent = parsedResult;
+        }
+
+        // If we couldn't get afterContent from result, fetch from file API
+        if (afterContent === null && toolInfo.filePath) {
+            try {
+                const response = await fetch(`${CONFIG.API_BASE_URL}/files/read?path=${encodeURIComponent(toolInfo.filePath)}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    afterContent = data.content;
+                }
+            } catch (error) {
+                console.warn('Failed to fetch after content:', error);
+            }
+        }
+
+        if (afterContent !== null && afterContent !== toolInfo.beforeContent) {
+            const diffBtn = document.createElement('button');
+            diffBtn.className = 'btn-show-diff';
+            diffBtn.innerHTML = '<i data-lucide="diff"></i><span>Show Changes</span>';
+            card.appendChild(diffBtn);
+
+            if (window.lucide) lucide.createIcons();
+
+            let diffContainer = null;
+            diffBtn.addEventListener('click', () => {
+                if (diffContainer) {
+                    diffContainer.style.display = diffContainer.style.display === 'none' ? 'block' : 'none';
+                    diffBtn.querySelector('span').textContent = diffContainer.style.display === 'none' ? 'Show Changes' : 'Hide Changes';
+                    return;
+                }
+
+                diffContainer = document.createElement('div');
+                diffContainer.innerHTML = window.diffViewer.renderLineDiff(toolInfo.beforeContent, afterContent, toolInfo.filePath);
+                card.appendChild(diffContainer);
+                diffBtn.querySelector('span').textContent = 'Hide Changes';
+            });
         }
     }
 
@@ -777,6 +921,8 @@ class AgentManager {
                     }
                 });
             });
+
+            if (window.lucide) lucide.createIcons();
         }
 
         // Store in messages (without think tags)
@@ -784,6 +930,10 @@ class AgentManager {
         this.messages.push({ role: 'assistant', content: cleanForStorage, timestamp: new Date() });
 
         this.currentStreamingElement = null;
+
+        // Reset streaming state and update button
+        this.isStreaming = false;
+        this.updateSendButton();
     }
 
     /**
@@ -980,26 +1130,31 @@ How can I help you today?`;
     formatMessage(content) {
         if (!content) return '';
 
+        let html = '';
         if (window.marked) {
             try {
                 // Use marked for high-fidelity parsing
-                const html = marked.parse(content);
-
-                // After parsing, we might need to re-initialize Lucide icons in the generated HTML
-                // (e.g. for the copy button icons)
-                setTimeout(() => {
-                    if (window.lucide) lucide.createIcons();
-                    this.attachCodeCopyHandlers();
-                }, 0);
-
-                return html;
+                html = marked.parse(content);
             } catch (error) {
                 console.error('Markdown parsing error:', error);
-                return this.fallbackFormatMessage(content);
+                html = this.fallbackFormatMessage(content);
             }
+        } else {
+            html = this.fallbackFormatMessage(content);
         }
 
-        return this.fallbackFormatMessage(content);
+        // BRUTE FORCE: If copy button is missing from any <pre> tags, inject it
+        // This handles cases where marked renderer is ignored
+        if (html.includes('<pre>') && !html.includes('code-copy-btn')) {
+            html = html.replace(/<pre>/g, '<pre style="position: relative;"><div class="code-copy-btn" title="Copy code" style="opacity: 0.8 !important;"><i data-lucide="copy"></i></div>');
+        }
+
+        // After parsing, we might need to re-initialize Lucide icons in the generated HTML
+        setTimeout(() => {
+            if (window.lucide) lucide.createIcons();
+        }, 0);
+
+        return html;
     }
 
     /**
@@ -1012,9 +1167,9 @@ How can I help you today?`;
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
 
-        // Basic Code blocks
+        // Basic Code blocks with Copy Button
         formatted = formatted.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-            return `<pre><code class="language-${lang}">${code.trim()}</code></pre>`;
+            return `<pre style="position: relative;"><div class="code-copy-btn" title="Copy code" style="opacity: 0.8 !important;"><i data-lucide="copy"></i></div><code class="language-${lang}">${code.trim()}</code></pre>`;
         });
 
         // Inline code
@@ -1030,34 +1185,6 @@ How can I help you today?`;
         return formatted;
     }
 
-    /**
-     * Attach click handlers to dynamically created copy buttons in messages
-     */
-    attachCodeCopyHandlers() {
-        const containers = document.querySelectorAll('.message-content pre');
-        containers.forEach(pre => {
-            const btn = pre.querySelector('.code-copy-btn');
-            const codeEl = pre.querySelector('code');
-
-            if (btn && codeEl && !btn.dataset.handlerAttached) {
-                btn.dataset.handlerAttached = 'true';
-                btn.addEventListener('click', () => {
-                    const code = codeEl.innerText;
-                    navigator.clipboard.writeText(code).then(() => {
-                        btn.classList.add('copied');
-                        btn.innerHTML = '<i data-lucide="check"></i><span>Copied!</span>';
-                        lucide.createIcons();
-
-                        setTimeout(() => {
-                            btn.classList.remove('copied');
-                            btn.innerHTML = '<i data-lucide="copy"></i><span>Copy</span>';
-                            lucide.createIcons();
-                        }, 2000);
-                    });
-                });
-            }
-        });
-    }
 
     /**
      * Extract code from message
@@ -1139,16 +1266,24 @@ How can I help you today?`;
         const clearBtn = document.getElementById('clearChatBtn');
         const toggleBtn = document.getElementById('toggleAgentBtn');
 
-        // Send message on button click
+        // Send/Stop toggle button click
         sendBtn?.addEventListener('click', () => {
-            this.sendMessage(input.value);
+            if (this.isStreaming) {
+                // Currently streaming - stop it
+                this.stopStreaming();
+            } else {
+                // Not streaming - send message
+                this.sendMessage(input.value);
+            }
         });
 
         // Send on Enter, new line on Shift+Enter
         input?.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                this.sendMessage(input.value);
+                if (!this.isStreaming) {
+                    this.sendMessage(input.value);
+                }
             }
         });
 
@@ -1222,6 +1357,37 @@ How can I help you today?`;
         historyModal?.addEventListener('click', (e) => {
             if (e.target === historyModal) {
                 this.hideHistoryModal();
+            }
+        });
+
+        // Event Delegation for Code Copy Buttons
+        document.getElementById('chatMessages')?.addEventListener('click', (e) => {
+            const copyBtn = e.target.closest('.code-copy-btn');
+            if (copyBtn) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const pre = copyBtn.closest('pre');
+                const codeEl = pre?.querySelector('code');
+
+                if (codeEl) {
+                    const code = codeEl.innerText || codeEl.textContent;
+                    navigator.clipboard.writeText(code).then(() => {
+                        copyBtn.classList.add('copied');
+                        const originalHTML = copyBtn.innerHTML;
+                        copyBtn.innerHTML = '<i data-lucide="check"></i>';
+                        if (window.lucide) lucide.createIcons();
+
+                        setTimeout(() => {
+                            copyBtn.classList.remove('copied');
+                            copyBtn.innerHTML = originalHTML;
+                            if (window.lucide) lucide.createIcons();
+                        }, 2000);
+                    }).catch(err => {
+                        console.error('Failed to copy code:', err);
+                        window.toast?.error('Failed to copy code');
+                    });
+                }
             }
         });
     }
