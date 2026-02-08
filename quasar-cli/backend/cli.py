@@ -77,12 +77,19 @@ def check_api_keys() -> bool:
 
 
 async def process_query(query: str, workspace: str, selected_model: Optional[str] = None) -> None:
-    """Process a single query and stream the response."""
+    """Process a single query and stream the response with rich visual feedback."""
     orchestrator = get_orchestrator()
     orchestrator.set_workspace(workspace)
     
+    # Load MCP servers if not already loaded
+    if orchestrator.mcp_manager and not orchestrator.mcp_tools:
+        mcp_count = await orchestrator.load_mcp_servers()
+        if mcp_count > 0:
+            console.print(f"[dim]🔌 Loaded {mcp_count} MCP server(s) with {len(orchestrator.mcp_tools)} tools[/dim]")
+    
     response_text = ""
     current_tool = None
+    plan_shown = False
     
     with Progress(
         SpinnerColumn(),
@@ -98,28 +105,103 @@ async def process_query(query: str, workspace: str, selected_model: Optional[str
                 
                 if chunk_type == "classification":
                     task_type = chunk.get("task_type", "unknown")
-                    progress.update(task_id, description=f"[cyan]Task: {task_type}[/cyan]")
+                    confidence = chunk.get("confidence", 0)
+                    progress.update(task_id, description=f"[cyan]Task: {task_type} ({confidence:.0%})[/cyan]")
+                
+                elif chunk_type == "thinking":
+                    # Show thinking in dim italic
+                    content = chunk.get("content", "")
+                    if content:
+                        progress.stop()
+                        console.print(f"[dim italic]💭 {content}[/dim italic]")
+                        progress.start()
+                
+                elif chunk_type == "plan":
+                    # Show structured plan
+                    if not plan_shown:
+                        progress.stop()
+                        steps = chunk.get("steps", [])
+                        console.print("\n[bold cyan]📋 Plan:[/bold cyan]")
+                        for i, step in enumerate(steps, 1):
+                            console.print(f"  [cyan]{i}.[/cyan] {step}")
+                        console.print()
+                        plan_shown = True
+                        progress.start()
                 
                 elif chunk_type == "iteration":
                     current = chunk.get("current", 1)
                     max_iter = chunk.get("max", 30)
-                    progress.update(task_id, description=f"[yellow]Iteration {current}/{max_iter}[/yellow]")
+                    remaining = chunk.get("remaining", 0)
+                    progress.update(task_id, description=f"[yellow]Iteration {current}/{max_iter} ({remaining} left)[/yellow]")
+                
+                elif chunk_type == "iteration_warning":
+                    # Warning when iterations running low
+                    remaining = chunk.get("remaining", 0)
+                    message = chunk.get("message", "")
+                    progress.stop()
+                    console.print(f"[yellow]⚠️ {message}[/yellow]")
+                    progress.start()
                 
                 elif chunk_type == "tool_start":
                     tool_name = chunk.get("tool", "unknown")
                     current_tool = tool_name
                     progress.update(task_id, description=f"[blue]🔧 {tool_name}...[/blue]")
                 
+                elif chunk_type == "tool_progress":
+                    # Progress during long-running tools
+                    tool = chunk.get("tool", "")
+                    prog = chunk.get("progress", 0)
+                    message = chunk.get("message", "")
+                    progress.update(task_id, description=f"[blue]🔧 {tool}: {message} ({prog:.0%})[/blue]")
+                
                 elif chunk_type == "tool_complete":
                     tool_name = chunk.get("tool", current_tool or "tool")
-                    console.print(f"  [green]✓[/green] {tool_name}")
+                    success = chunk.get("success", True)
+                    icon = "✓" if success else "✗"
+                    color = "green" if success else "red"
+                    console.print(f"  [{color}]{icon}[/{color}] {tool_name}")
                     current_tool = None
+                
+                elif chunk_type == "observation":
+                    # Model's interpretation of tool result
+                    observation = chunk.get("observation", "")
+                    if observation:
+                        console.print(f"[dim]   → {observation}[/dim]")
+                
+                elif chunk_type == "file_changed":
+                    # File system changes
+                    path = chunk.get("path", "")
+                    action = chunk.get("action", "")
+                    lines = chunk.get("lines", 0)
+                    
+                    icons = {"created": "📝", "modified": "✏️", "deleted": "🗑️"}
+                    icon = icons.get(action, "📄")
+                    console.print(f"  {icon} {action.capitalize()}: [green]{path}[/green] ({lines} lines)")
+                
+                elif chunk_type == "command_output":
+                    # Terminal command output
+                    output = chunk.get("output", "")
+                    is_error = chunk.get("is_error", False)
+                    if output:
+                        color = "red" if is_error else "dim"
+                        console.print(f"[{color}]{output}[/{color}]")
                 
                 elif chunk_type == "message":
                     # Progress/observation messages
                     msg = chunk.get("content", "")
                     if msg:
-                        progress.update(task_id, description=f"[dim]{msg[:60]}...[/dim]" if len(msg) > 60 else f"[dim]{msg}[/dim]")
+                        # Check if it's a progress message (starts with emoji or special chars)
+                        if msg.startswith(("⚠️", "✓", "→", "💭", "📋")):
+                            progress.stop()
+                            console.print(f"[dim]{msg}[/dim]")
+                            progress.start()
+                        else:
+                            progress.update(task_id, description=f"[dim]{msg[:60]}...[/dim]" if len(msg) > 60 else f"[dim]{msg}[/dim]")
+                
+                elif chunk_type == "debug":
+                    # Debug messages (only show if verbose mode)
+                    # For now, skip debug messages in normal mode
+                    pass
                 
                 elif chunk_type == "token":
                     # Streaming response text - collect it
@@ -140,6 +222,9 @@ async def process_query(query: str, workspace: str, selected_model: Optional[str
                     provider = chunk.get("provider", "unknown")
                     tools_used = chunk.get("tools_used", [])
                     tool_count = chunk.get("tool_calls_count", 0)
+                    iterations = chunk.get("iterations", 1)
+                    loop_detected = chunk.get("loop_detected", False)
+                    max_iterations_reached = chunk.get("max_iterations_reached", False)
                     
                     # Print the response
                     if response_text:
@@ -151,6 +236,12 @@ async def process_query(query: str, workspace: str, selected_model: Optional[str
                     summary = f"[dim]Model: {provider}/{model}"
                     if tool_count > 0:
                         summary += f" | Tools: {tool_count}"
+                    if iterations > 1:
+                        summary += f" | Iterations: {iterations}"
+                    if loop_detected:
+                        summary += " | [yellow]Loop detected[/yellow]"
+                    if max_iterations_reached:
+                        summary += " | [yellow]Max iterations reached[/yellow]"
                     summary += "[/dim]"
                     console.print(summary)
                     return

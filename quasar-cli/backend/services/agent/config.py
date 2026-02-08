@@ -36,6 +36,11 @@ class AgentConfig:
     Centralized agent configuration.
     
     Configurable and scalable - easy to add new models/providers.
+    
+    Model Priority (for tool calling):
+    1. Cerebras - Best for tool calling, fast inference
+    2. Ollama - Local models, good tool calling
+    3. Groq - LAST RESORT (tool calling issues with some models)
     """
     
     # Provider configurations
@@ -66,8 +71,10 @@ class AgentConfig:
             enabled=True,
             base_url="https://api.groq.com/openai/v1",
             models={
+                # NOTE: gpt-oss-120b works well with tool calling
                 "openai/gpt-oss-120b": ModelConfig("openai/gpt-oss-120b", "groq"),
                 "openai/gpt-oss-20b": ModelConfig("openai/gpt-oss-20b", "groq"),
+                # Other Groq models have tool calling issues - use with caution
                 "llama-3.3-70b-versatile": ModelConfig("llama-3.3-70b-versatile", "groq"),
                 "meta-llama/llama-4-scout-17b-16e-instruct": ModelConfig("meta-llama/llama-4-scout-17b-16e-instruct", "groq"),
             }
@@ -75,93 +82,54 @@ class AgentConfig:
         "cloudflare": ProviderConfig(
             name="cloudflare",
             enabled=False,  # Skipped 
-            models={
-                # "@cf/meta/llama-3.1-70b-instruct": ModelConfig("@cf/meta/llama-3.1-70b-instruct", "cloudflare"),
-                # "@cf/meta/llama-3.1-8b-instruct": ModelConfig("@cf/meta/llama-3.1-8b-instruct", "cloudflare"),
-                # "@cf/qwen/qwen2.5-coder-32b-instruct": ModelConfig("@cf/qwen/qwen2.5-coder-32b-instruct", "cloudflare"),
-            }
+            models={}
         ),
     }
     
-    # Task to model mapping (configurable)
-    # Format: task_type -> [(provider, model_key), ...]
-    # First is primary, rest are fallbacks
+    # Task to model mapping (6 tool-aligned categories)
+    # Priority: Cerebras → Ollama → Groq (Groq last due to tool calling issues)
+    # Only gpt-oss from Groq works well for tools
     TASK_MODELS: Dict[str, List[tuple]] = {
-        # Task 1: Conversational Chat
+        # File operations - needs reliable tool calling
+        "file_operations": [
+            ("cerebras", "zai-glm-4.7"),          # Best for tools
+            ("ollama", "glm-4.7:cloud"),          # Good fallback
+            ("groq", "openai/gpt-oss-120b"),      # Groq's best for tools
+        ],
+        
+        # Search - simple, fast
+        "search": [
+            ("cerebras", "zai-glm-4.7"),
+            ("ollama", "glm-4.7:cloud"),
+            ("groq", "openai/gpt-oss-120b"),
+        ],
+        
+        # Execution - suggest commands
+        "execution": [
+            ("cerebras", "zai-glm-4.7"),
+            ("ollama", "glm-4.7:cloud"),
+            ("groq", "openai/gpt-oss-120b"),
+        ],
+        
+        # Web - fetch URLs, research
+        "web": [
+            ("cerebras", "zai-glm-4.7"),
+            ("ollama", "glm-4.7:cloud"),
+            ("groq", "openai/gpt-oss-120b"),
+        ],
+        
+        # Code Intelligence - explain, analyze
+        "code_intelligence": [
+            ("cerebras", "zai-glm-4.7"),
+            ("ollama", "deepseek-v3.1:671b-cloud"),  # Good for code understanding
+            ("groq", "openai/gpt-oss-120b"),
+        ],
+        
+        # General chat - all tools
         "chat": [
             ("cerebras", "zai-glm-4.7"),
             ("ollama", "glm-4.7:cloud"),
             ("groq", "openai/gpt-oss-120b"),
-        ],
-        
-        # Task 2: Code Explanation (Simple)
-        "code_explain_simple": [
-            ("ollama", "glm-4.7:cloud"),
-            ("groq", "openai/gpt-oss-120b"),
-            ("cerebras", "zai-glm-4.7"),
-        ],
-        
-        # Task 3: Code Explanation (Complex)
-        "code_explain_complex": [
-            ("groq", "openai/gpt-oss-120b"),
-            ("cerebras", "qwen-3-235b-a22b-instruct-2507"),
-            ("ollama", "qwen3-coder:480b-cloud"),
-        ],
-        
-        # Task 4: Code Generation (Function/Class)
-        "code_generation": [
-            ("cerebras", "zai-glm-4.7"),
-            ("ollama", "glm-4.7:cloud"),
-            ("groq", "openai/gpt-oss-120b"),
-        ],
-        
-        # Task 5: Code Generation (Multi-file/Module)
-        "code_generation_multi": [
-            ("cerebras", "zai-glm-4.7"),
-            ("ollama", "qwen3-coder:480b-cloud"),
-            ("groq", "openai/gpt-oss-120b"),
-        ],
-        
-        # Task 6: Bug Detection & Fixing
-        "bug_fixing": [
-            ("ollama", "deepseek-v3.1:671b-cloud"),
-            ("cerebras", "qwen-3-235b-a22b-instruct-2507"),
-            ("groq", "openai/gpt-oss-120b"),
-        ],
-        
-        # Task 7: Code Refactoring
-        "refactor": [
-            ("cerebras", "zai-glm-4.7"),
-            ("ollama", "glm-4.7:cloud"),
-            ("groq", "llama-3.3-70b-versatile"),
-        ],
-        
-        # Task 8: Architecture & Design
-        "architecture": [
-            ("ollama", "deepseek-v3.1:671b-cloud"),
-            ("cerebras", "qwen-3-235b-a22b-instruct-2507"),
-            ("groq", "openai/gpt-oss-120b"),
-        ],
-        
-        # Task 9: Test Generation
-        "test_generation": [
-            ("ollama", "glm-4.7:cloud"),
-            ("cerebras", "zai-glm-4.7"),
-            ("groq", "llama-3.3-70b-versatile"),
-        ],
-        
-        # Task 10: Documentation Generation
-        "documentation": [
-            ("groq", "openai/gpt-oss-20b"),
-            ("ollama", "deepseek-v3.2:cloud"),
-            ("cerebras", "zai-glm-4.7"),
-        ],
-        
-        # Task 11: Web & Documentation Research
-        "research": [
-            ("cerebras", "zai-glm-4.7"),
-            ("ollama", "glm-4.7:cloud"),
-            ("groq", "llama-3.3-70b-versatile"),
         ],
     }
     
@@ -172,34 +140,41 @@ class AgentConfig:
     TIMEOUT_SECONDS = 60
     
     # Agentic Loop Configuration
-    MAX_TOOL_ITERATIONS = 30          # Max tool call loops per request (increased for complex tasks)
-    TOOL_TIMEOUT_SECONDS = 180         # Timeout per individual tool execution
-    PIP_INSTALL_TIMEOUT = 180         # Extended timeout for pip install commands (2 minutes)
+    MAX_TOOL_ITERATIONS = 30          # Max tool call loops per request
+    TOOL_TIMEOUT_SECONDS = 180        # Timeout per individual tool execution
+    PIP_INSTALL_TIMEOUT = 180         # Extended timeout for pip install commands
     ENABLE_TOOL_CONFIRMATION = False  # Require user confirmation for dangerous ops
     
-    # Task types that should use tools
+    # Tool Output Limits (prevents context overflow)
+    MAX_FILE_CONTENT_CHARS = 30000    # ~7.5K tokens per file read
+    MAX_OTHER_RESULT_CHARS = 10000    # ~2.5K tokens for other results
+    MAX_FILE_LINES = 2000             # Files larger than this return metadata only
+    MAX_SEARCH_RESULTS = 50           # Max files returned by search
+    MAX_SEARCH_MATCHES = 100          # Max matches returned by grep
+    MAX_URL_CHARS = 8000              # Max chars extracted from URLs
+    MAX_HISTORY_SIZE = 20             # Max tool results kept in memory
+    
+    # Timeouts
+    MCP_TIMEOUT = 30.0                # MCP server call timeout
+    URL_FETCH_TIMEOUT = 10.0          # HTTP request timeout
+    
+    # All task types use tools now
     TOOL_ENABLED_TASKS = [
-        "code_generation",
-        "code_generation_multi",
-        "bug_fixing",
-        "refactor",
-        "test_generation",
-        "architecture",
-        "code_explain_simple",       
-        "code_explain_complex",
+        "file_operations",
+        "search",
+        "execution",
+        "web",
+        "code_intelligence",
         "chat",
-        "documentation",
-        "research",
     ]
     
-    # Tasks that are read-only (can't modify/create files) - only chat
-    READ_ONLY_TASKS = [
-    ]
+    # No read-only tasks - all can use tools
+    READ_ONLY_TASKS = []
     
     @classmethod
     def get_models_for_task(cls, task_type: str) -> List[tuple]:
         """Get list of (provider, model_key) for a task type."""
-        return cls.TASK_MODELS.get(task_type, [("ollama", "chat")])
+        return cls.TASK_MODELS.get(task_type, [("cerebras", "zai-glm-4.7")])
     
     @classmethod
     def get_provider(cls, provider_name: str) -> Optional[ProviderConfig]:

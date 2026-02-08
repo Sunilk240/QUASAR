@@ -84,26 +84,29 @@ class ModelProviders:
         Returns:
             ChatOpenAI instance or None
         """
+        logger.info(f"🧠 Creating Cerebras model: {model_name}")
         api_key = self.cred_manager.get_credential("cerebras")
         if not api_key:
-            print("Warning: No Cerebras API key available")
+            logger.warning("❌ No Cerebras API key available")
             return None
             
         try:
             from langchain_openai import ChatOpenAI
             
-            return ChatOpenAI(
+            model = ChatOpenAI(
                 base_url="https://api.cerebras.ai/v1",
                 api_key=api_key,
                 model=model_name,
                 temperature=temperature,
                 **kwargs
             )
+            logger.info(f"✅ Cerebras model created: {model_name}")
+            return model
         except ImportError:
-            print("Warning: langchain-openai not installed")
+            logger.error("❌ langchain-openai not installed")
             return None
         except Exception as e:
-            print(f"Error creating Cerebras model: {e}")
+            logger.error(f"❌ Error creating Cerebras model: {e}")
             return None
     
     def get_groq_model(
@@ -122,25 +125,28 @@ class ModelProviders:
         Returns:
             ChatGroq instance or None
         """
+        logger.info(f"💙 Creating Groq model: {model_name}")
         api_key = self.cred_manager.get_credential("groq")
         if not api_key:
-            print("Warning: No Groq API key available")
+            logger.warning("❌ No Groq API key available")
             return None
             
         try:
             from langchain_groq import ChatGroq
             
-            return ChatGroq(
+            model = ChatGroq(
                 model=model_name,
                 groq_api_key=api_key,
                 temperature=temperature,
                 **kwargs
             )
+            logger.info(f"✅ Groq model created: {model_name}")
+            return model
         except ImportError:
-            print("Warning: langchain-groq not installed")
+            logger.error("❌ langchain-groq not installed")
             return None
         except Exception as e:
-            print(f"Error creating Groq model: {e}")
+            logger.error(f"❌ Error creating Groq model: {e}")
             return None
     
     def get_cloudflare_model(
@@ -159,9 +165,10 @@ class ModelProviders:
         Returns:
             ChatOpenAI instance or None
         """
+        logger.info(f"☁️ Creating Cloudflare model: {model_name}")
         creds = self.cred_manager.get_cloudflare_credentials()
         if not creds:
-            print("Warning: No Cloudflare credentials available")
+            logger.warning("❌ No Cloudflare credentials available")
             return None
             
         account_id, api_token = creds
@@ -169,18 +176,20 @@ class ModelProviders:
         try:
             from langchain_openai import ChatOpenAI
             
-            return ChatOpenAI(
+            model = ChatOpenAI(
                 base_url=f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
                 api_key=api_token,
                 model=model_name,
                 temperature=temperature,
                 **kwargs
             )
+            logger.info(f"✅ Cloudflare model created: {model_name}")
+            return model
         except ImportError:
-            print("Warning: langchain-openai not installed")
+            logger.error("❌ langchain-openai not installed")
             return None
         except Exception as e:
-            print(f"Error creating Cloudflare model: {e}")
+            logger.error(f"❌ Error creating Cloudflare model: {e}")
             return None
     
     def get_model(
@@ -201,6 +210,8 @@ class ModelProviders:
         Returns:
             ChatModel instance or None
         """
+        logger.info(f"🔧 get_model called: provider={provider}, model={model_name}")
+        
         if provider == "ollama":
             return self.get_ollama_model(model_name, temperature, **kwargs)
         elif provider == "cerebras":
@@ -210,5 +221,5 @@ class ModelProviders:
         elif provider == "cloudflare":
             return self.get_cloudflare_model(model_name, temperature, **kwargs)
         else:
-            print(f"Unknown provider: {provider}")
+            logger.error(f"❌ Unknown provider: {provider}")
             return None

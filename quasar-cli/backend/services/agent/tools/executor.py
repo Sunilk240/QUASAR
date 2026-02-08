@@ -17,6 +17,8 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 import logging
 
+from ..config import AgentConfig
+
 # Setup logger
 logger = logging.getLogger("tool_executor")
 
@@ -55,9 +57,9 @@ class ToolExecutionResult:
     
     def _format_result(self, result: Any) -> str:
         """Format tool result as string for LLM with context length management."""
-        # Maximum characters per result type to prevent context overflow
-        MAX_FILE_CONTENT_CHARS = 30000  # ~7.5K tokens
-        MAX_OTHER_RESULT_CHARS = 10000  # ~2.5K tokens
+        # Use centralized config for limits
+        MAX_FILE_CONTENT_CHARS = AgentConfig.MAX_FILE_CONTENT_CHARS
+        MAX_OTHER_RESULT_CHARS = AgentConfig.MAX_OTHER_RESULT_CHARS
         
         if result is None:
             return "Tool executed successfully (no output)"
@@ -67,12 +69,16 @@ class ToolExecutionResult:
             if "error" in result:
                 return f"Error: {result['error']}"
             elif "content" in result:
-                # File content - truncate if too long
+                # File content - smart truncation (keep head + tail)
                 content = result.get("content", "")
                 if len(content) > MAX_FILE_CONTENT_CHARS:
-                    truncated = content[:MAX_FILE_CONTENT_CHARS]
-                    remaining = len(content) - MAX_FILE_CONTENT_CHARS
-                    return f"File content (truncated, {remaining} chars remaining):\n{truncated}\n...[TRUNCATED]"
+                    # Smart truncation: 40% head, 60% tail (errors usually at end)
+                    head_chars = int(MAX_FILE_CONTENT_CHARS * 0.4)  # 12K chars
+                    tail_chars = int(MAX_FILE_CONTENT_CHARS * 0.6)  # 18K chars
+                    head = content[:head_chars]
+                    tail = content[-tail_chars:]
+                    middle_skipped = len(content) - head_chars - tail_chars
+                    return f"File content (truncated, {middle_skipped} chars in middle skipped):\n{head}\n\n... [{middle_skipped} characters omitted] ...\n\n{tail}"
                 return f"File content:\n{content}"
             elif "is_large_file" in result and result.get("is_large_file"):
                 # Large file metadata - pass through
@@ -112,7 +118,11 @@ class ToolExecutor:
     - Supports async execution
     - Tracks execution time
     - Logs all tool operations
+    - History size limit to prevent memory leaks
     """
+    
+    # Use centralized config for limits
+    MAX_HISTORY_SIZE = AgentConfig.MAX_HISTORY_SIZE
     
     def __init__(self, tools: List[BaseTool], timeout_seconds: int = 30):
         """
@@ -226,14 +236,19 @@ class ToolExecutor:
                 duration_ms=duration_ms
             )
         
-        # Track execution history
+        # Track execution history (with size limit to prevent memory leaks)
         self.execution_history.append(execution_result)
+        if len(self.execution_history) > self.MAX_HISTORY_SIZE:
+            self.execution_history = self.execution_history[-self.MAX_HISTORY_SIZE:]
         
         return execution_result
     
     async def execute_tool_calls(self, tool_calls: List[Any]) -> List[ToolMessage]:
         """
         Execute multiple tool calls and return ToolMessages.
+        
+        Automatically parallelizes independent read operations for performance.
+        State-modifying operations execute sequentially for safety.
         
         Args:
             tool_calls: List of tool calls from LLM response
@@ -246,10 +261,126 @@ class ToolExecutor:
         
         logger.info(f"🔧 Executing {len(tool_calls)} tool calls...")
         
+        # Analyze dependencies and group tools
+        independent, dependent = self._analyze_tool_dependencies(tool_calls)
+        
         tool_messages = []
+        
+        # Execute independent tools in parallel
+        if independent:
+            logger.info(f"⚡ Executing {len(independent)} independent tools in parallel")
+            parallel_results = await self._execute_parallel(independent)
+            tool_messages.extend(parallel_results)
+        
+        # Execute dependent tools sequentially
+        if dependent:
+            logger.info(f"🔄 Executing {len(dependent)} dependent tools sequentially")
+            for tool_call in dependent:
+                result = await self.execute_tool_call(tool_call)
+                tool_messages.append(result.to_tool_message())
+        
+        return tool_messages
+    
+    def _analyze_tool_dependencies(self, tool_calls: List[Any]) -> tuple[List[Any], List[Any]]:
+        """
+        Analyze tool calls to determine which can run in parallel.
+        
+        Tools that only read data can run in parallel.
+        Tools that modify state must run sequentially.
+        
+        Args:
+            tool_calls: List of tool calls
+            
+        Returns:
+            Tuple of (independent_tools, dependent_tools)
+        """
+        # Tools that can always run in parallel (read-only operations)
+        PARALLELIZABLE_TOOLS = {
+            # File tools (read-only)
+            "read_file",
+            "read_file_chunk",
+            
+            # Search tools (all read-only)
+            "find_files",
+            "search_content",
+            "explore_codebase",
+            "list_directory",
+            
+            # Terminal tools (read-only)
+            "check_command_available",
+            "suggest_command",  # Suggest-only, doesn't execute
+            
+            # Web tools
+            "suggest_web_search",
+            "read_url_simple",
+            
+            # Code intelligence (read-only)
+            "get_diagnostics",
+            "get_symbols",
+            "find_definition",
+            "find_references",
+        }
+        
+        # Tools that must run sequentially (modify state)
+        SEQUENTIAL_TOOLS = {
+            "create_file",
+            "modify_file",
+            "patch_file",
+            "delete_file",
+            "move_file",
+        }
+        
+        independent = []
+        dependent = []
+        
         for tool_call in tool_calls:
-            result = await self.execute_tool_call(tool_call)
-            tool_messages.append(result.to_tool_message())
+            tool_name = tool_call.get("name", "") if isinstance(tool_call, dict) else getattr(tool_call, "name", "")
+            
+            if tool_name in PARALLELIZABLE_TOOLS:
+                independent.append(tool_call)
+            else:
+                # Default to sequential for safety (unknown tools)
+                dependent.append(tool_call)
+        
+        return independent, dependent
+    
+    async def _execute_parallel(self, tool_calls: List[Any]) -> List[ToolMessage]:
+        """
+        Execute multiple tool calls in parallel using asyncio.gather.
+        
+        Args:
+            tool_calls: List of independent tool calls
+            
+        Returns:
+            List of ToolMessages in the same order as tool_calls
+        """
+        if not tool_calls:
+            return []
+        
+        # Create tasks for all tool calls
+        tasks = [self.execute_tool_call(tool_call) for tool_call in tool_calls]
+        
+        # Execute in parallel
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Convert results to ToolMessages
+        tool_messages = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Handle exception from gather
+                tool_call = tool_calls[i]
+                tool_name = tool_call.get("name", "") if isinstance(tool_call, dict) else getattr(tool_call, "name", "")
+                tool_call_id = tool_call.get("id", "") if isinstance(tool_call, dict) else getattr(tool_call, "id", "")
+                
+                error_result = ToolExecutionResult(
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    success=False,
+                    error=str(result)
+                )
+                tool_messages.append(error_result.to_tool_message())
+            else:
+                tool_messages.append(result.to_tool_message())
         
         return tool_messages
     

@@ -34,8 +34,9 @@ user_settings_context: ContextVar[Dict[str, Any]] = ContextVar("user_settings", 
 class Credential:
     """Single credential entry."""
     key: str
-    remaining_quota: int = 10000  # Estimated
     is_active: bool = True
+    # Note: Real quota tracking would require API calls to each provider
+    # Not implemented - would add latency and complexity
     
 
 @dataclass 
@@ -135,8 +136,23 @@ class CredentialManager:
         
         # Ollama - no credentials needed (local)
         self._providers["ollama"] = ProviderCredentials(
-            credentials=[Credential(key="local", remaining_quota=999999)]
+            credentials=[Credential(key="local")]
         )
+    
+    def get_key_count(self, provider: str) -> int:
+        """Get number of active keys for a provider."""
+        provider_creds = self._get_provider_creds(provider)
+        if not provider_creds or not provider_creds.credentials:
+            return 0
+        return sum(1 for c in provider_creds.credentials if c.is_active)
+    
+    def get_total_key_count(self) -> int:
+        """Get total number of keys across all providers (for retry calculation)."""
+        total = 0
+        for provider in ["cerebras", "groq", "cloudflare", "ollama"]:
+            total += self.get_key_count(provider)
+        logger.info(f"📊 Total keys available: {total}")
+        return total
     
     def _get_provider_creds(self, provider: str) -> Optional[ProviderCredentials]:
         """Get provider credentials, checking user context first."""
@@ -184,24 +200,73 @@ class CredentialManager:
             True if successfully rotated, False if no more credentials
         """
         provider_creds = self._get_provider_creds(provider)
-        if not provider_creds:
+        if not provider_creds or not provider_creds.credentials:
             return False
         
-        # Mark current as inactive
+        current = provider_creds.current_index
+        total_creds = len(provider_creds.credentials)
+        
+        # If only one credential, can't rotate
+        if total_creds <= 1:
+            logger.warning(f"⚠️ Cannot rotate {provider}: only 1 credential available")
+            return False
+        
+        # Try next credential (don't mark current as inactive yet - might be temporary)
+        next_index = (current + 1) % total_creds
+        
+        # Check if we've tried all credentials already
+        if next_index == current:
+            logger.warning(f"⚠️ Cannot rotate {provider}: already at last credential")
+            return False
+        
+        # Check if next credential is available
+        if provider_creds.credentials[next_index].is_active:
+            provider_creds.current_index = next_index
+            logger.info(f"🔄 Rotated {provider} from key {current + 1} to key {next_index + 1}")
+            return True
+        
+        # Next credential is inactive, try to find any active one
+        for i in range(total_creds):
+            if i != current and provider_creds.credentials[i].is_active:
+                provider_creds.current_index = i
+                logger.info(f"🔄 Rotated {provider} from key {current + 1} to key {i + 1}")
+                return True
+        
+        logger.warning(f"⚠️ Cannot rotate {provider}: no active credentials remaining")
+        return False
+    
+    def mark_credential_exhausted(self, provider: str) -> None:
+        """
+        Mark current credential as exhausted (inactive).
+        Call this after confirming a credential is truly exhausted.
+        
+        Args:
+            provider: Provider name
+        """
+        provider_creds = self._get_provider_creds(provider)
+        if not provider_creds:
+            return
+        
         current = provider_creds.current_index
         if current < len(provider_creds.credentials):
             provider_creds.credentials[current].is_active = False
+            logger.info(f"❌ Marked {provider} key {current + 1} as exhausted")
+    
+    def get_remaining_keys(self, provider: str) -> int:
+        """
+        Get count of remaining active keys for a provider.
         
-        # Try next credential
-        next_index = (current + 1) % len(provider_creds.credentials)
-        if next_index == current:
-            return False  # No other credentials
+        Args:
+            provider: Provider name
             
-        if provider_creds.credentials[next_index].is_active:
-            provider_creds.current_index = next_index
-            return True
-            
-        return False
+        Returns:
+            Number of active credentials remaining
+        """
+        provider_creds = self._get_provider_creds(provider)
+        if not provider_creds:
+            return 0
+        
+        return sum(1 for c in provider_creds.credentials if c.is_active)
     
     def is_provider_available(self, provider: str) -> bool:
         """Check if provider has available credentials."""
@@ -246,4 +311,3 @@ class CredentialManager:
         for provider_creds in self._providers.values():
             for cred in provider_creds.credentials:
                 cred.is_active = True
-                cred.remaining_quota = 10000

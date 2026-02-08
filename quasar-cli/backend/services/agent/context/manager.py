@@ -6,8 +6,6 @@ Manages hierarchical context:
 - Task: Current file, selection, errors
 - Summary: Compressed conversation history
 - Session: Files created, actions taken
-
-Implements token budgeting per task type.
 """
 
 from typing import Dict, Any, Optional, List
@@ -58,26 +56,12 @@ class SessionMemory:
     commands_run: List[str] = field(default_factory=list)
     
 
-# Token budgets per task type (from agent_orchestration.md)
-TOKEN_BUDGETS = {
-    "chat": {"permanent": 100, "task": 200, "summary": 100, "total": 400},
-    "code_explain_simple": {"permanent": 100, "task": 1000, "summary": 200, "total": 1300},
-    "code_explain_complex": {"permanent": 100, "task": 2000, "summary": 400, "total": 2500},
-    "code_generation": {"permanent": 100, "task": 1500, "summary": 300, "total": 1900},
-    "code_generation_multi": {"permanent": 100, "task": 3000, "summary": 500, "total": 3600},
-    "bug_fixing": {"permanent": 100, "task": 1500, "summary": 300, "total": 1900},
-    "refactor": {"permanent": 100, "task": 2000, "summary": 400, "total": 2500},
-    "architecture": {"permanent": 100, "task": 2000, "summary": 400, "total": 2500},
-    "test_generation": {"permanent": 100, "task": 1500, "summary": 300, "total": 1900},
-    "documentation": {"permanent": 100, "task": 1000, "summary": 200, "total": 1300},
-}
-
 
 class ContextManager:
     """
     Manages context for AI agent conversations.
     
-    Provides hierarchical context with token budgeting.
+    Provides hierarchical context for different task types.
     """
     
     def __init__(self):
@@ -144,20 +128,18 @@ class ContextManager:
         """Record command in session."""
         self.session.commands_run.append(command)  # Full command
     
-    def get_context_for_task(self, task_type: str) -> Dict[str, Any]:
+    def get_context_for_task(self, task_type: str = None) -> Dict[str, Any]:
         """
-        Build context dict for a task, respecting token budgets.
+        Build context dict for a task.
         
         Returns structured context ready for prompt building.
+        Note: Token budgets removed - modern LLMs handle context automatically.
         """
-        budget = TOKEN_BUDGETS.get(task_type, TOKEN_BUDGETS["chat"])
-        
         context = {
-            "permanent": self._build_permanent_context(budget["permanent"]),
-            "task": self._build_task_context(budget["task"]),
-            "summary": self._build_summary_context(budget["summary"]),
+            "permanent": self._build_permanent_context(),
+            "task": self._build_task_context(),
+            "summary": self._build_summary_context(),
             "session": self._build_session_context(),
-            "token_budget": budget["total"]
         }
         
         return context
@@ -178,7 +160,7 @@ class ContextManager:
         self.conversation_history = []
         self.conversation_summary = ""
     
-    def _build_permanent_context(self, token_limit: int) -> str:
+    def _build_permanent_context(self) -> str:
         """Build permanent context string."""
         lines = []
         if self.permanent.workspace_path:
@@ -190,12 +172,9 @@ class ContextManager:
         
         return "\n".join(lines)
     
-    def _build_task_context(self, token_limit: int) -> str:
-        """Build task context string (no file content - user will provide path)."""
+    def _build_task_context(self) -> str:
+        """Build task context string."""
         lines = []
-        
-        # Note: We don't include file_content here - user will provide file path
-        # and agent will read it if needed. This saves tokens.
         
         if self.task.current_file:
             lines.append(f"Current file: {self.task.current_file} ({self.task.file_language})")
@@ -211,7 +190,7 @@ class ContextManager:
         
         return "\n\n".join(lines)
     
-    def _build_summary_context(self, token_limit: int) -> str:
+    def _build_summary_context(self) -> str:
         """Build conversation summary."""
         if self.conversation_summary:
             return f"Previous context: {self.conversation_summary}"

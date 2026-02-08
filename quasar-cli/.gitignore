@@ -29,6 +29,7 @@ wheels/
 venv/
 .venv/
 ENV/
+.demo/
 
 # IDE
 .idea/
@@ -52,3 +53,5 @@ htmlcov/
 # Build artifacts
 *.whl
 *.tar.gz
+.quasar/
+commit_msg.txt

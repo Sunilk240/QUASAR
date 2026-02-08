@@ -4,10 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quasar-ai"
-version = "1.1.0"
+version = "2.0.0"
 description = "🚀 QUASAR - AI-powered CLI code editor with agentic capabilities"
 readme = "README.md"
-license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
     {name = "Sunil Kumawat"}
@@ -17,7 +16,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -28,17 +26,27 @@ classifiers = [
 dependencies = [
     "typer>=0.9.0",
     "rich>=13.0.0",
-    "fastapi>=0.109.0",
-    "uvicorn[standard]>=0.27.0",
-    "python-multipart>=0.0.6",
+    "prompt-toolkit>=3.0.0",
     "pydantic>=2.5.0",
     "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+    # LangChain
     "langchain>=0.1.0",
     "langchain-core>=0.1.0",
+    "langchain-community>=0.0.20",
     "langchain-openai>=0.0.5",
     "langchain-groq>=0.0.1",
     "langchain-ollama>=0.0.1",
+    # HTTP & WebSocket
     "websockets>=12.0",
+    "aiohttp>=3.9.0",
+    "httpx>=0.26.0",
+    # Web Search & Content Tools
+    "tavily-python>=0.3.0",
+    "wikipedia>=1.4.0",
+    "arxiv>=2.1.0",
+    "duckduckgo-search>=4.0.0",
+    "ddgs>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -52,9 +60,8 @@ dev = [
 quasar = "backend.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/sunilkumawat/quasar-ai"
-Documentation = "https://github.com/sunilkumawat/quasar-ai#readme"
-Repository = "https://github.com/sunilkumawat/quasar-ai"
+Documentation = "https://sunilk240.github.io/quasar-cli/"
+Repository = "https://github.com/Sunilk240/QUASAR/tree/main/quasar-cli"
 
 [tool.setuptools.packages.find]
 where = ["."]

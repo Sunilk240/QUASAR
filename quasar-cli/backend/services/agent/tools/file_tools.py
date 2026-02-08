@@ -16,18 +16,24 @@ from pathlib import Path
 import os
 from langchain_core.tools import tool
 
-# Import logging
+# Import logging and config
 from ..logger import agent_logger
+from ..config import AgentConfig
+
+# Import backup manager
+from .backup_manager import BackupManager
 
 
 # Workspace will be set by the agent when initialized
 _workspace_path: Optional[Path] = None
+_backup_manager: Optional[BackupManager] = None
 
 
 def set_workspace(path: str):
-    """Set the current workspace path."""
-    global _workspace_path
+    """Set the current workspace path and initialize backup manager."""
+    global _workspace_path, _backup_manager
     _workspace_path = Path(path)
+    _backup_manager = BackupManager(_workspace_path)
     agent_logger.info(f"🔧 Tool workspace set: {path}")
 
 
@@ -38,6 +44,15 @@ def get_workspace() -> Path:
         # Default to current directory if not set
         return Path(os.getcwd())
     return _workspace_path
+
+
+def _count_lines_fast(path: Path) -> int:
+    """Count lines without loading entire file into memory."""
+    try:
+        with path.open('rb') as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
 
 
 def validate_path(path: str) -> tuple[bool, str, Optional[Path]]:
@@ -51,8 +66,40 @@ def validate_path(path: str) -> tuple[bool, str, Optional[Path]]:
     
     # Check for path traversal
     if ".." in path:
-        agent_logger.warning(f"⚠️ Path traversal attempt: {path}")
+        agent_logger.warning(f"Path traversal attempt: {path}")
         return (False, "Path traversal (..) not allowed", None)
+    
+    # Block sensitive files (security)
+    BLOCKED_FILES = {
+        ".env", ".env.local", ".env.production", ".env.development",
+        ".env.test", ".env.staging",
+        "secrets.json", "credentials.json", "config.secret.json",
+        ".aws/credentials", ".aws/config",
+        ".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_dsa",
+        ".npmrc", ".pypirc",
+    }
+    
+    BLOCKED_EXTENSIONS = {".pem", ".key", ".p12", ".pfx"}
+    
+    path_lower = path.lower()
+    filename = Path(path).name.lower()
+    file_ext = Path(path).suffix.lower()
+    
+    # Check exact filename matches
+    for blocked in BLOCKED_FILES:
+        if "/" in blocked:  # Path pattern like .aws/credentials
+            if blocked in path_lower:
+                agent_logger.warning(f"🚫 Blocked access to sensitive file: {path}")
+                return (False, f"Access to sensitive file '{blocked}' is blocked for security", None)
+        else:  # Filename pattern
+            if filename == blocked or blocked in path_lower:
+                agent_logger.warning(f"🚫 Blocked access to sensitive file: {path}")
+                return (False, f"Access to sensitive file '{blocked}' is blocked for security", None)
+    
+    # Check file extensions
+    if file_ext in BLOCKED_EXTENSIONS:
+        agent_logger.warning(f"🚫 Blocked access to sensitive file type: {path}")
+        return (False, f"Access to sensitive file type '{file_ext}' is blocked for security", None)
     
     # Resolve full path
     if Path(path).is_absolute():
@@ -66,10 +113,36 @@ def validate_path(path: str) -> tuple[bool, str, Optional[Path]]:
     try:
         full_path.relative_to(workspace)
     except ValueError:
-        agent_logger.warning(f"⚠️ Path outside workspace: {path}")
+        agent_logger.warning(f"Path outside workspace: {path}")
         return (False, f"Path must be within workspace: {workspace}", None)
     
     return (True, "", full_path)
+
+
+# ============================================================================
+# File Caching (10x faster for repeated reads)
+# ============================================================================
+from functools import lru_cache
+
+@lru_cache(maxsize=20)
+def _read_file_cached(path: str, mtime: float) -> str:
+    """Read file with caching. Cache invalidates when file changes (mtime)."""
+    return Path(path).read_text(encoding='utf-8')
+
+
+def read_file_content(path: Path) -> str:
+    """Read file content with caching support."""
+    try:
+        mtime = path.stat().st_mtime
+        return _read_file_cached(str(path), mtime)
+    except Exception:
+        # Fallback to direct read if caching fails
+        return path.read_text(encoding='utf-8')
+
+
+def clear_file_cache():
+    """Clear the file cache (call when files are modified)."""
+    _read_file_cached.cache_clear()
 
 
 def detect_language(file_path: str) -> str:
@@ -131,15 +204,13 @@ def read_file(path: str) -> Dict[str, Any]:
         return {"error": f"Not a file: {path}"}
     
     try:
-        content = full_path.read_text(encoding="utf-8")
-        lines = content.split("\n")
-        line_count = len(lines)
-        size_bytes = len(content.encode("utf-8"))
+        # Fast check: count lines without loading content first (uses config)
+        line_count = _count_lines_fast(full_path)
+        size_bytes = full_path.stat().st_size
         
-        # Check if file is too large
-        MAX_LINES = 2000
-        if line_count > MAX_LINES:
-            agent_logger.warning(f"⚠️ Large file detected: {path} ({line_count} lines). Returning metadata only.")
+        # If file is too large, return metadata only (don't load content)
+        if line_count > AgentConfig.MAX_FILE_LINES:
+            agent_logger.warning(f"Large file detected: {path} ({line_count} lines). Returning metadata only.")
             return {
                 "path": path,
                 "language": detect_language(path),
@@ -150,7 +221,10 @@ def read_file(path: str) -> Dict[str, Any]:
                 "hint": f"File has {line_count} lines. Use read_file_chunk(path, start_line, end_line) to read specific sections. Recommended chunk size: 500 lines."
             }
         
-        agent_logger.info(f"✅ read_file success: {path} ({len(content)} chars, {line_count} lines)")
+        # Only load content for small files (uses cache for repeated reads)
+        content = read_file_content(full_path)
+        
+        agent_logger.info(f"read_file success: {path} ({len(content)} chars, {line_count} lines)")
         return {
             "content": content,
             "path": path,
@@ -159,7 +233,7 @@ def read_file(path: str) -> Dict[str, Any]:
             "size_bytes": size_bytes
         }
     except Exception as e:
-        agent_logger.error(f"❌ read_file error: {path} - {e}")
+        agent_logger.error(f"read_file error: {path} - {e}")
         return {"error": f"Failed to read file: {str(e)}"}
 
 
@@ -278,17 +352,18 @@ def create_file(path: str, content: str, overwrite: bool = False) -> Dict[str, A
 
 
 @tool
-def modify_file(path: str, content: str, create_backup: bool = False) -> Dict[str, Any]:
+def modify_file(path: str, content: str) -> Dict[str, Any]:
     """
     Modify an existing file with new content.
+    
+    Automatically creates backup before modifying.
     
     Args:
         path: File path relative to workspace
         content: New file content
-        create_backup: If True, create .bak backup before modifying
         
     Returns:
-        Dictionary with success status
+        Dictionary with success status and backup info
     """
     is_valid, error, full_path = validate_path(path)
     if not is_valid:
@@ -298,11 +373,10 @@ def modify_file(path: str, content: str, create_backup: bool = False) -> Dict[st
         return {"error": f"File not found: {path}"}
     
     try:
-        # Create backup if requested
-        backup_path = None
-        if create_backup:
-            backup_path = full_path.with_suffix(full_path.suffix + ".bak")
-            backup_path.write_text(full_path.read_text(encoding="utf-8"), encoding="utf-8")
+        # ALWAYS create backup before modifying
+        backup_id = None
+        if _backup_manager:
+            backup_id = _backup_manager.create_backup(full_path, "modify")
         
         # Write new content
         full_path.write_text(content, encoding="utf-8")
@@ -314,8 +388,9 @@ def modify_file(path: str, content: str, create_backup: bool = False) -> Dict[st
             "size_bytes": len(content.encode("utf-8"))
         }
         
-        if backup_path:
-            result["backup_path"] = str(backup_path.relative_to(get_workspace()))
+        if backup_id:
+            result["backup_id"] = backup_id
+            result["backup_message"] = "✅ Backup created automatically"
         
         return result
     except Exception as e:
@@ -329,6 +404,8 @@ def patch_file(path: str, find_text: str, replace_text: str, occurrence: int = 1
     
     Use this for TARGETED edits when you only need to change a specific section
     without rewriting the entire file. For example, updating a checkbox from [ ] to [x].
+    
+    Automatically creates backup before patching.
     
     Args:
         path: File path relative to workspace
@@ -378,16 +455,27 @@ def patch_file(path: str, find_text: str, replace_text: str, occurrence: int = 1
             new_content = content[:idx] + replace_text + content[idx + len(find_text):]
             replaced_count = 1
         
+        # ALWAYS create backup before patching
+        backup_id = None
+        if _backup_manager:
+            backup_id = _backup_manager.create_backup(full_path, "patch")
+        
         # Write back
         full_path.write_text(new_content, encoding="utf-8")
         
         agent_logger.info(f"✅ patch_file success: {path} ({replaced_count} replacement(s))")
-        return {
+        result = {
             "success": True,
             "path": path,
             "replacements": replaced_count,
             "occurrences_found": count
         }
+        
+        if backup_id:
+            result["backup_id"] = backup_id
+            result["backup_message"] = "✅ Backup created automatically"
+        
+        return result
         
     except Exception as e:
         agent_logger.error(f"❌ patch_file error: {path} - {e}")
@@ -399,12 +487,14 @@ def delete_file(path: str, recursive: bool = False) -> Dict[str, Any]:
     """
     Delete a file or directory.
     
+    Automatically creates backup before deleting.
+    
     Args:
         path: File/directory path relative to workspace
         recursive: If True, delete directories recursively
         
     Returns:
-        Dictionary with success status
+        Dictionary with success status and backup info
     """
     is_valid, error, full_path = validate_path(path)
     if not is_valid:
@@ -414,20 +504,40 @@ def delete_file(path: str, recursive: bool = False) -> Dict[str, Any]:
         return {"error": f"Path not found: {path}"}
     
     try:
+        # ALWAYS create backup before deleting
+        backup_id = None
+        if _backup_manager and full_path.is_file():
+            backup_id = _backup_manager.create_backup(full_path, "delete")
+        
         if full_path.is_file():
             full_path.unlink()
-            return {"success": True, "deleted": path, "type": "file"}
+            return {
+                "success": True,
+                "deleted": path,
+                "type": "file",
+                "backup_id": backup_id,
+                "backup_message": "✅ Backup created - can be restored if needed" if backup_id else None
+            }
         elif full_path.is_dir():
             if recursive:
                 import shutil
                 shutil.rmtree(full_path)
-                return {"success": True, "deleted": path, "type": "directory"}
+                return {
+                    "success": True,
+                    "deleted": path,
+                    "type": "directory",
+                    "backup_message": "⚠️ Directory deleted (no backup for directories)"
+                }
             else:
                 # Check if directory is empty
                 if any(full_path.iterdir()):
                     return {"error": f"Directory not empty: {path}. Set recursive=True to delete."}
                 full_path.rmdir()
-                return {"success": True, "deleted": path, "type": "directory"}
+                return {
+                    "success": True,
+                    "deleted": path,
+                    "type": "directory"
+                }
     except Exception as e:
         return {"error": f"Failed to delete: {str(e)}"}
 
@@ -480,268 +590,127 @@ def move_file(source: str, destination: str) -> Dict[str, Any]:
         return {"error": f"Failed to move: {str(e)}"}
 
 
-@tool
-def list_files(path: str = ".", recursive: bool = False) -> Dict[str, Any]:
-    """
-    List files and directories in a path.
-    
-    Args:
-        path: Directory path relative to workspace (default: workspace root)
-        recursive: If True, list recursively (limited to 100 files, 50 dirs)
-        
-    Returns:
-        Dictionary with files and directories
-    """
-    # Limits to prevent context overflow
-    MAX_FILES = 100
-    MAX_DIRS = 50
-    
-    is_valid, error, full_path = validate_path(path)
-    if not is_valid:
-        return {"error": error}
-    
-    if not full_path.exists():
-        return {"error": f"Path not found: {path}"}
-    
-    if not full_path.is_dir():
-        return {"error": f"Not a directory: {path}"}
-    
-    try:
-        files = []
-        directories = []
-        files_truncated = False
-        dirs_truncated = False
-        
-        if recursive:
-            for item in full_path.rglob("*"):
-                rel_path = str(item.relative_to(full_path))
-                
-                # Skip common ignored directories
-                if any(part in [".git", "__pycache__", "node_modules", ".venv", "venv"] for part in item.parts):
-                    continue
-                
-                if item.is_file():
-                    if len(files) < MAX_FILES:
-                        files.append({
-                            "path": rel_path,
-                            "language": detect_language(rel_path),
-                            "size": item.stat().st_size
-                        })
-                    else:
-                        files_truncated = True
-                elif item.is_dir():
-                    if len(directories) < MAX_DIRS:
-                        directories.append(rel_path)
-                    else:
-                        dirs_truncated = True
-        else:
-            for item in full_path.iterdir():
-                if item.is_file():
-                    if len(files) < MAX_FILES:
-                        files.append({
-                            "path": item.name,
-                            "language": detect_language(item.name),
-                            "size": item.stat().st_size
-                        })
-                    else:
-                        files_truncated = True
-                elif item.is_dir():
-                    if len(directories) < MAX_DIRS:
-                        directories.append(item.name)
-                    else:
-                        dirs_truncated = True
-        
-        result = {
-            "path": path,
-            "files": files,
-            "directories": sorted(directories),
-            "total_files": len(files),
-            "total_directories": len(directories)
-        }
-        
-        # Add hints if truncated
-        if files_truncated or dirs_truncated:
-            result["truncated"] = True
-            result["hint"] = f"Results limited to {MAX_FILES} files and {MAX_DIRS} directories. Use a more specific path to see more."
-        
-        return result
-    except Exception as e:
-        return {"error": f"Failed to list files: {str(e)}"}
-
+# ============================================================================
+# Backup & Restore Tools
+# ============================================================================
 
 @tool
-def search_files(query: str, file_pattern: str = "*.py", path: str = ".") -> Dict[str, Any]:
+def restore_backup(backup_id: str) -> Dict[str, Any]:
     """
-    Search for text pattern in files.
+    Restore a file from backup.
+    
+    Use list_backups() to see available backups.
     
     Args:
-        query: Text to search for
-        file_pattern: Glob pattern for files to search (e.g., "*.py")
-        path: Directory to search in
+        backup_id: Backup ID from list_backups()
         
     Returns:
-        Dictionary with matches
+        Success status
     """
-    is_valid, error, full_path = validate_path(path)
-    if not is_valid:
-        return {"error": error}
+    if not _backup_manager:
+        return {"error": "Backup manager not initialized"}
     
-    if not full_path.exists():
-        return {"error": f"Path not found: {path}"}
-    
-    try:
-        matches = []
-        
-        for file in full_path.rglob(file_pattern):
-            # Skip excluded directories
-            if any(part in ["__pycache__", "node_modules", ".git", ".venv"] for part in file.parts):
-                continue
-            
-            if not file.is_file():
-                continue
-            
-            try:
-                content = file.read_text(encoding="utf-8")
-                for line_num, line in enumerate(content.split("\n"), 1):
-                    if query in line:
-                        rel_path = str(file.relative_to(full_path))
-                        matches.append({
-                            "file": rel_path,
-                            "line": line_num,
-                            "content": line.strip()  # Show full line
-                        })
-            except:
-                continue
-        
+    if _backup_manager.restore_backup(backup_id):
         return {
-            "query": query,
-            "pattern": file_pattern,
-            "matches": matches,  # Limit results removed
-            "total_matches": len(matches)
+            "success": True,
+            "message": f"✅ Restored backup {backup_id}",
+            "backup_id": backup_id
         }
-    except Exception as e:
-        return {"error": f"Search failed: {str(e)}"}
+    else:
+        return {"error": f"Backup {backup_id} not found or restore failed"}
 
 
 @tool
-def grep_search(query: str, path: str = ".", include_pattern: str = None) -> Dict[str, Any]:
+def list_backups(file_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    High-performance text search using native system tools (findstr on Windows).
+    List available backups.
     
     Args:
-        query: Text pattern to search for
-        path: Directory to search in (default: workspace root)
-        include_pattern: Optional file pattern (e.g., "*.py")
+        file_path: Optional - filter by specific file
         
     Returns:
-        Dictionary with match results
+        List of backups with timestamps
     """
-    is_valid, error, full_path = validate_path(path)
-    if not is_valid:
-        return {"error": error}
-        
-    import subprocess
-    import platform
+    if not _backup_manager:
+        return {"error": "Backup manager not initialized"}
     
-    matches = []
-    
-    try:
-        if platform.system() == "Windows":
-            # Use findstr for extreme speed on Windows
-            # /S = recursive, /N = line number, /I = case insensitive (optional, keeping it case-sensitive for now)
-            cmd = ["findstr", "/S", "/N", query]
-            if include_pattern:
-                cmd.append(include_pattern)
-            else:
-                cmd.append("*.*")
-                
-            process = subprocess.run(cmd, cwd=full_path, capture_output=True, text=True, encoding="cp437", errors="ignore")
-            output = process.stdout
-            
-            for line in output.splitlines():
-                if ":" in line:
-                    try:
-                        # findstr format: path:line:content
-                        parts = line.split(":", 2)
-                        if len(parts) >= 3:
-                            rel_path = parts[0]
-                            # Filter out ignored dirs
-                            if any(d in rel_path for d in [".git", "node_modules", "__pycache__", ".editor"]):
-                                continue
-                                
-                            matches.append({
-                                "file": rel_path,
-                                "line": int(parts[1]),
-                                "content": parts[2].strip()
-                            })
-                    except:
-                        continue
-        else:
-            # Fallback to existing search_files logic for non-windows if rg not found
-            return search_files(query, include_pattern or "*", path)
-            
-        return {
-            "query": query,
-            "matches": matches[:100], # Limit to 100 for context safety
-            "total_matches": len(matches),
-            "truncated": len(matches) > 100
-        }
-    except Exception as e:
-        return {"error": f"Grep search failed: {str(e)}"}
-
-
-@tool
-def list_tree_fast(path: str = ".", max_depth: int = 3) -> Dict[str, Any]:
-    """
-    Highly optimized recursive file listing using os.scandir.
-    Use this for getting a quick overview of the project structure.
-    
-    Args:
-        path: Directory to list
-        max_depth: Maximum recursion depth
-        
-    Returns:
-        Flattened list of all files in a tree-like format
-    """
-    is_valid, error, full_path = validate_path(path)
-    if not is_valid:
-        return {"error": error}
-        
-    import os
-    
-    tree = []
-    
-    def _scan(dir_path: Path, current_depth: int):
-        if current_depth > max_depth:
-            return
-            
-        try:
-            with os.scandir(dir_path) as it:
-                for entry in it:
-                    # Skip ignored dirs
-                    if entry.is_dir():
-                        if entry.name in [".git", "node_modules", "__pycache__", ".editor", "venv", ".venv"]:
-                            continue
-                        rel_path = str(Path(entry.path).relative_to(full_path))
-                        tree.append(f"📁 {rel_path}/")
-                        _scan(entry.path, current_depth + 1)
-                    else:
-                        rel_path = str(Path(entry.path).relative_to(full_path))
-                        tree.append(f"📄 {rel_path}")
-        except (PermissionError, FileNotFoundError):
-            pass
-            
-    _scan(full_path, 1)
+    backups = _backup_manager.list_backups(file_path)
     
     return {
-        "path": path,
-        "tree": tree[:500], # Limit output size
-        "count": len(tree),
-        "truncated": len(tree) > 500
+        "backups": backups,
+        "total": len(backups),
+        "message": "Use restore_backup(backup_id) to restore a backup"
     }
 
 
-# Export all file tools
+@tool
+def show_diff(path: str, backup_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Show differences between current file and backup.
+    
+    Args:
+        path: File path
+        backup_id: Optional backup ID (defaults to most recent)
+        
+    Returns:
+        Diff in unified format
+    """
+    if not _backup_manager:
+        return {"error": "Backup manager not initialized"}
+    
+    is_valid, error, full_path = validate_path(path)
+    if not is_valid:
+        return {"error": error}
+    
+    # Get backup
+    if backup_id:
+        backup_info = next((b for b in _backup_manager.index["backups"] if b["id"] == backup_id), None)
+        if not backup_info:
+            return {"error": f"Backup {backup_id} not found"}
+    else:
+        backup_info = _backup_manager.get_last_backup(path)
+        if not backup_info:
+            return {"error": f"No backups found for {path}"}
+        backup_id = backup_info["id"]
+    
+    # Read both versions
+    old_content = _backup_manager.get_backup_content(backup_id)
+    if old_content is None:
+        return {"error": f"Could not read backup {backup_id}"}
+    
+    if full_path.exists():
+        try:
+            new_content = full_path.read_text(encoding='utf-8')
+        except Exception as e:
+            return {"error": f"Could not read current file: {str(e)}"}
+    else:
+        new_content = "[FILE DELETED]"
+    
+    # Generate diff (simple line-by-line)
+    import difflib
+    diff = difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=f"{path} (backup {backup_info['timestamp']})",
+        tofile=f"{path} (current)",
+        lineterm=''
+    )
+    
+    diff_text = ''.join(diff)
+    
+    if not diff_text:
+        diff_text = "No differences found"
+    
+    return {
+        "path": path,
+        "backup_id": backup_id,
+        "backup_timestamp": backup_info["timestamp"],
+        "diff": diff_text,
+        "lines_changed": diff_text.count('\n')
+    }
+
+
+# Export file operation tools only (search tools are in search_tools.py)
 FILE_TOOLS = [
     read_file,
     read_file_chunk,
@@ -750,8 +719,8 @@ FILE_TOOLS = [
     patch_file,
     delete_file,
     move_file,
-    list_files,
-    search_files,
-    grep_search,
-    list_tree_fast
+    restore_backup,
+    list_backups,
+    show_diff,
 ]
+

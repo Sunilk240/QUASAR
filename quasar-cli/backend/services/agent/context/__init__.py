@@ -4,7 +4,6 @@ Context Management Package for AI Agent
 Exports:
 - ContextManager: Main context manager
 - ConversationSummarizer: Summarizes conversation history
-- TOKEN_BUDGETS: Token limits per task type
 """
 
 from .manager import (
@@ -13,7 +12,6 @@ from .manager import (
     TaskContext,
     SessionMemory,
     ConversationMessage,
-    TOKEN_BUDGETS
 )
 
 from .summarizer import (
@@ -27,7 +25,7 @@ __all__ = [
     "TaskContext",
     "SessionMemory",
     "ConversationMessage",
-    "TOKEN_BUDGETS",
     "ConversationSummarizer",
     "get_summarizer"
 ]
+

@@ -13,29 +13,45 @@ from .file_tools import (
     patch_file,
     delete_file,
     move_file,
-    list_files,
-    search_files,
-    grep_search,
-    list_tree_fast,
+    restore_backup,
+    list_backups,
+    show_diff,
     set_workspace,
     get_workspace
 )
 
 from .web_tools import (
     WEB_TOOLS,
-    search_web,
-    read_url,
-    browse_interactive
+    extract_relevant_content,
+    tavily_search,
+    duckduckgo_search,
+    jina_reader,
+    fetch_url_content,
+    wikipedia_search,
+    arxiv_search,
+    github_search
 )
 
 from .terminal_tools import (
     TERMINAL_TOOLS,
-    run_terminal_command,
-    run_python_file,
-    run_pip_command,
-    get_terminal_output,
-    clear_terminal_buffer,
+    suggest_command,
     check_command_available
+)
+
+from .search_tools import (
+    SEARCH_TOOLS,
+    find_files,
+    search_content,
+    explore_codebase,
+    list_directory
+)
+
+from .code_intelligence import (
+    CODE_INTELLIGENCE_TOOLS,
+    get_diagnostics,
+    get_symbols,
+    find_definition,
+    find_references
 )
 
 from .executor import (
@@ -47,17 +63,21 @@ from .executor import (
 
 
 # All tools combined
-ALL_TOOLS = FILE_TOOLS + TERMINAL_TOOLS + WEB_TOOLS
+ALL_TOOLS = FILE_TOOLS + TERMINAL_TOOLS + WEB_TOOLS + SEARCH_TOOLS + CODE_INTELLIGENCE_TOOLS
 
 # Tool categories for selective use
 TOOLS_BY_CATEGORY = {
     "read_only": [
-        read_file, read_file_chunk, list_files, search_files, grep_search, list_tree_fast,
-        get_terminal_output, check_command_available, search_web, read_url
+        read_file, read_file_chunk, 
+        find_files, search_content, explore_codebase, list_directory,
+        check_command_available, tavily_search, duckduckgo_search, jina_reader, fetch_url_content,
+        get_diagnostics, get_symbols, find_definition, find_references
     ],
     "write": [create_file, modify_file, patch_file, delete_file, move_file],
-    "execute": [run_terminal_command, run_python_file, run_pip_command],
+    "suggest": [suggest_command, check_command_available],
+    "search": SEARCH_TOOLS,
     "web": WEB_TOOLS,
+    "code_intelligence": CODE_INTELLIGENCE_TOOLS,
 }
 
 
@@ -65,34 +85,34 @@ def get_tools_for_task(task_type: str) -> list:
     """
     Get appropriate tools for a task type.
     
+    PRINCIPLE: Give each task type the MINIMUM tools needed + common helpers.
+    
     Args:
-        task_type: Type of task (chat, code_generation, bug_fixing, etc.)
+        task_type: Type of task (file_operations, search, execution, web, code_intelligence, chat)
         
     Returns:
         List of tools appropriate for the task
     """
-    # Simple READ tasks - read only
-    read_only_tasks = ["code_explain_simple", "code_explain_complex"]
+    # Task-specific tool mapping
+    task_tools = {
+        # File operations: edit files + search to find them
+        "file_operations": FILE_TOOLS + SEARCH_TOOLS,
+        
+        # Search: find things + read to show results
+        "search": SEARCH_TOOLS + FILE_TOOLS,
+        
+        # Execution: suggest commands + read scripts/configs + find files
+        "execution": TERMINAL_TOOLS + FILE_TOOLS + SEARCH_TOOLS,
+        
+        # Web: fetch URLs + save to files + search existing docs
+        "web": WEB_TOOLS + FILE_TOOLS + SEARCH_TOOLS,
+        
+        # Code intelligence: analyze + read + search
+        "code_intelligence": CODE_INTELLIGENCE_TOOLS + FILE_TOOLS + SEARCH_TOOLS,
+        
+        # Chat: everything except terminal (safer for casual conversation)
+        "chat": FILE_TOOLS + SEARCH_TOOLS + WEB_TOOLS + CODE_INTELLIGENCE_TOOLS
+    }
     
-    # Chat task - needs ALL tools for agentic operations (move, delete, create, etc.)
-    full_agentic_tasks = ["chat"]
-    
-    # Code generation - can create files
-    generation_tasks = ["code_generation", "code_generation_multi", "test_generation", "documentation"]
-    
-    # Bug fixing - can modify files and run commands
-    full_access_tasks = ["bug_fixing", "refactor"]
-    
-    if task_type in read_only_tasks:
-        return TOOLS_BY_CATEGORY["read_only"]
-    elif task_type in ["research"]: # New explicit research task
-        return WEB_TOOLS + [read_file, list_files, list_tree_fast]
-    elif task_type in full_agentic_tasks:
-        return ALL_TOOLS
-    elif task_type in generation_tasks:
-        # Generation tasks now get research capabilities to find docs
-        return FILE_TOOLS + WEB_TOOLS + [run_terminal_command, check_command_available]
-    elif task_type in full_access_tasks:
-        return ALL_TOOLS
-    else:
-        return ALL_TOOLS
+    return task_tools.get(task_type, ALL_TOOLS)
+

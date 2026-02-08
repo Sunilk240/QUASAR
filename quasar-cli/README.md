@@ -1,6 +1,8 @@
 # 🚀 QUASAR - AI-Powered CLI Code Editor
 
-An intelligent command-line assistant that can understand your codebase, generate code, fix bugs, and execute tasks using AI.
+An intelligent command-line code editor that can understand your codebase, generate code, fix bugs, and execute tasks using AI.
+
+**📚 [Documentation](https://sunilk240.github.io/quasar-cli/)**
 
 ## Installation
 
@@ -23,8 +25,15 @@ GROQ_API_KEY_2=gsk_your_second_key_here
 
 # Cerebras
 CEREBRAS_API_KEY_1=csk_your_key_here
+CEREBRAS_API_KEY_2=csk_your_second_key_here
 
 # Ollama runs locally - no API key needed
+# Default: http://localhost:11434
+
+# Web Search (optional but recommended)
+# QUASAR has multiple web tools with fallback support
+# Get free key at: https://tavily.com
+TAVILY_API_KEY=tvly_your_key_here
 ```
 
 ### Option 2: Using Environment Variables
@@ -38,14 +47,9 @@ export GROQ_API_KEY_2="gsk_your_second_key_here"
 export CEREBRAS_API_KEY_1="csk_your_key_here"
 ```
 
-### Multiple Keys & Fallback Behavior
+### Multiple Keys
 
-You can add multiple keys per provider (e.g., `GROQ_API_KEY_1`, `GROQ_API_KEY_2`, `GROQ_API_KEY_3`).
-
-**In Auto mode** (default):
-- If the first key hits rate limits or fails, QUASAR automatically tries the second key
-- If all keys for a provider fail, it falls back to the next provider
-- Fallback chain: Groq → Cerebras → Ollama
+You can add multiple keys per provider (e.g., `GROQ_API_KEY_1`, `GROQ_API_KEY_2`, `GROQ_API_KEY_3`). If a key hits rate limits, QUASAR automatically rotates to the next available key.
 
 **Get free API keys:**
 - Groq: https://console.groq.com
@@ -75,60 +79,75 @@ quasar --workspace /path/to/project "add tests for api.py"
 
 ### Custom Model Selection
 
-By default, QUASAR automatically selects the best model for each task. You can override this with `--model`:
+By default, QUASAR automatically selects the best model. You can override with `--model`:
 
 ```bash
-# Use a specific Cerebras model
 quasar --model cerebras/qwen-3-32b "explain this code"
-
-# Use Groq with a specific model
 quasar --model groq/llama-3.3-70b-versatile "create a REST API"
-
-# Use local Ollama model
 quasar --model ollama/qwen2.5-coder:7b "fix the bug"
-
-# Interactive mode with custom model
-quasar -i -m cerebras/qwen-3-32b
 ```
 
-> **Note**: When you select a model, it will be used for ALL tasks. Choose a model that supports tool calling and has good reasoning capabilities.
+## Project Configuration (.quasar/)
 
-## Supported Tasks
+On first run, QUASAR creates a `.quasar/` directory in your workspace with project-specific configuration:
 
-QUASAR automatically classifies your request and uses the best model:
-
-| Task | Example |
-|------|---------|
-| Chat | "What is machine learning?" |
-| Code Generation | "Create a REST API endpoint" |
-| Bug Fixing | "Fix the TypeError in app.py" |
-| Code Explanation | "Explain this function" |
-| Refactoring | "Improve the structure of utils.py" |
-| Documentation | "Add docstrings to main.py" |
-| Test Generation | "Write tests for calculator.py" |
-
-## Web Tools (Beta)
-
-QUASAR can search the web and read URLs to help with your tasks:
-
-```bash
-quasar "search for the latest Python best practices"
-quasar "read the documentation at https://docs.python.org/3/library/asyncio.html"
+```
+.quasar/
+├── context.md    # Your project rules & preferences
+├── memory.json   # Session history & recent files
+├── mcp.json      # MCP server configuration
+├── hooks/        # Custom lifecycle hooks (templates provided)
+└── backups/      # Automatic file backups
 ```
 
-### Web Search Configuration
+### context.md
 
-Add to your `.env` file:
+Customize QUASAR's behavior for your project by editing `.quasar/context.md`:
 
-```env
-# Tavily API Key - Get from https://tavily.com
-TAVILY_API_KEY=your_tavily_api_key_here
+- **Project Description**: Help QUASAR understand your project goals
+- **Code Style**: Your preferred conventions (type hints, naming, etc.)
+- **Important Files**: Key files QUASAR should be aware of
+- **Project Rules**: Custom rules for QUASAR to follow
 
-# SearXNG Host (if self-hosting)
-# SEARX_HOST=http://localhost:8080
+### hooks/
+
+Add custom Python hooks to control QUASAR's behavior:
+- `PRE_TOOL_USE`: Run before any tool execution
+- `POST_TOOL_USE`: Run after tool execution
+- `ON_COMPLETE`: Run when task completes
+
+Templates are provided in `.quasar/hooks/` - rename `.template` files to `.py` to activate.
+
+### mcp.json
+
+QUASAR supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for extending tool capabilities with external servers.
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": ["python", "my_mcp_server.py"],
+      "description": "Custom MCP server"
+    }
+  }
+}
 ```
 
-> ⚠️ **Beta**: Web tools are in beta phase. Results may vary.
+## Backup & Recovery
+
+QUASAR automatically backs up files before modifying or deleting them.
+
+- **Location**: `.quasar/backups/`
+- **Auto-cleanup**: Last 50 backups kept
+- **Restore**: Ask QUASAR to "list backups" or "restore backup"
+
+## Security
+
+QUASAR blocks access to sensitive files:
+- `.env` files (all variants)
+- SSH keys (`.ssh/id_rsa`, etc.)
+- AWS credentials (`.aws/credentials`)
+- Certificates (`.pem`, `.key`, `.p12`, `.pfx`)
 
 ## Updating
 

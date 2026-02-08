@@ -9,7 +9,7 @@ Routes requests to the appropriate model based on:
 Configurable via config.py - easy to add new models.
 """
 
-from typing import Optional, Any, List
+from typing import Optional, Any, List, Dict
 from .providers import ModelProviders
 from .credentials import CredentialManager
 from ..config import AgentConfig
@@ -30,6 +30,7 @@ class ModelRouter:
     def __init__(self):
         self.providers = ModelProviders()
         self.cred_manager = CredentialManager()
+        
         logger.debug("ModelRouter initialized")
     
     def get_model(
@@ -53,26 +54,31 @@ class ModelRouter:
         # Get model chain for this task
         models = AgentConfig.get_models_for_task(task_type)
         
+        logger.info(f"🔍 get_model called: task={task_type}, fallback_level={fallback_level}, chain_length={len(models)}")
+        
         if fallback_level >= len(models):
-            # No more fallbacks, try Ollama as last resort
-            return self.providers.get_ollama_model(
-                model_name="qwen2.5-coder:7b",
-                temperature=temperature or AgentConfig.DEFAULT_TEMPERATURE
-            )
+            # No more fallbacks available
+            logger.warning(f"❌ No more fallback models available for task '{task_type}' at level {fallback_level}")
+            return None
         
         provider, model_key = models[fallback_level]
+        logger.info(f"  📌 Trying provider={provider}, model_key={model_key}")
         
         # Check if provider is available
         if not self.cred_manager.is_provider_available(provider):
-            # Try next fallback
+            logger.warning(f"  ⚠️ Provider {provider} not available, trying next fallback...")
             return self.get_model(task_type, fallback_level + 1, temperature, **kwargs)
+        
+        logger.debug(f"  ✅ Provider {provider} is available")
         
         # Get model config
         provider_config = AgentConfig.get_provider(provider)
         if not provider_config or model_key not in provider_config.models:
+            logger.warning(f"  ⚠️ Model config missing for {provider}/{model_key}, trying next fallback...")
             return self.get_model(task_type, fallback_level + 1, temperature, **kwargs)
         
         model_config = provider_config.models[model_key]
+        logger.info(f"  🎯 Creating model: {provider}/{model_config.name}")
         
         # Create model instance
         model = self.providers.get_model(
@@ -83,9 +89,10 @@ class ModelRouter:
         )
         
         if model is None:
-            # Provider failed, try next
+            logger.warning(f"  ❌ Model creation FAILED for {provider}/{model_config.name}, trying next fallback...")
             return self.get_model(task_type, fallback_level + 1, temperature, **kwargs)
         
+        logger.info(f"  ✅ Model created successfully: {provider}/{model_config.name}")
         return model
     
     def get_model_for_provider(
@@ -100,29 +107,35 @@ class ModelRouter:
         
         Args:
             provider: Provider name (ollama, cerebras, groq, cloudflare)
-            model_name_or_key: Model name OR config key (e.g., "code" -> "glm-4.7:cloud")
+            model_name_or_key: Model name OR config key (e.g., "zai-glm-4.7")
             temperature: Sampling temperature
             
         Returns:
             LangChain ChatModel instance or None
         """
-        # Default models per provider
-        defaults = {
-            "ollama": "qwen2.5-coder:7b",
-            "cerebras": "qwen-3-32b",
-            "groq": "llama-3.3-70b-versatile",
-            "cloudflare": "@cf/meta/llama-3.1-70b-instruct"
-        }
-        
-        model_name = model_name_or_key or defaults.get(provider, "")
-        
-        # Check if model_name is actually a config key (like "code", "chat", etc.)
-        # If so, look up the actual model name from the config
         provider_config = AgentConfig.get_provider(provider)
-        if provider_config and model_name_or_key in provider_config.models:
+        if not provider_config:
+            logger.error(f"Provider '{provider}' not found in config")
+            return None
+        
+        # If no model specified, use first model from provider config
+        if not model_name_or_key:
+            if not provider_config.models:
+                logger.error(f"No models configured for provider '{provider}'")
+                return None
+            # Get first model key from config
+            first_model_key = list(provider_config.models.keys())[0]
+            model_name_or_key = first_model_key
+            logger.debug(f"No model specified, using first model: {first_model_key}")
+        
+        # Check if model_name_or_key is a config key
+        if model_name_or_key in provider_config.models:
             actual_model = provider_config.models[model_name_or_key]
             model_name = actual_model.name
             logger.debug(f"Resolved config key '{model_name_or_key}' -> model '{model_name}'")
+        else:
+            # Assume it's already a model name
+            model_name = model_name_or_key
         
         return self.providers.get_model(
             provider=provider,
@@ -181,16 +194,6 @@ class ModelRouter:
                 self.cred_manager.rotate_credential(provider)
                 continue
         
-        # All failed, try Ollama as emergency fallback
-        logger.warning("⚠️ All primary models failed, trying emergency Ollama fallback...")
-        try:
-            model = self.providers.get_ollama_model("qwen2.5-coder:7b")
-            if model:
-                response = await model.ainvoke(messages)
-                logger.info("✅ Emergency fallback success: ollama/qwen2.5-coder:7b")
-                return (response, "ollama", "qwen2.5-coder:7b")
-        except Exception as e:
-            logger.error(f"❌ Emergency Ollama fallback failed: {e}")
-        
-        logger.error("❌ All models failed, including emergency fallback")
+        # All models in chain failed
+        logger.error(f"❌ All models failed for task '{task_type}'")
         return (None, "", "")
