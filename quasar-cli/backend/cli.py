@@ -29,6 +29,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 from services.agent.orchestrator import Orchestrator
 from services.agent.models import CredentialManager
 
+# Version
+__version__ = "2.0.1"
+
+def version_callback(value: bool):
+    """Show version and exit."""
+    if value:
+        console.print(f"[bold cyan]QUASAR[/bold cyan] v{__version__}")
+        raise typer.Exit()
+
 app = typer.Typer(
     name="quasar",
     help="🚀 QUASAR - AI-powered CLI code editor",
@@ -308,6 +317,7 @@ def main(
     interactive: bool = typer.Option(False, "--interactive", "-i", help="Run in interactive REPL mode"),
     workspace: str = typer.Option(None, "--workspace", "-w", help="Workspace directory (default: current dir)"),
     model: str = typer.Option(None, "--model", "-m", help="Model to use (format: provider/model-name, e.g., cerebras/qwen-3-32b)"),
+    version: Optional[bool] = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True, help="Show version and exit"),
 ):
     """
     🚀 QUASAR - AI-powered CLI code editor

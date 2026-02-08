@@ -64,6 +64,7 @@ class MCPServer:
         """
         try:
             logger.info(f"🔌 Connecting to MCP server '{self.name}'...")
+            logger.debug(f"   Command: {self.command}")
             
             # Prepare environment
             env = os.environ.copy()
@@ -78,6 +79,26 @@ class MCPServer:
                 env=env,
                 cwd=self.cwd
             )
+            
+            # Give the server time to start (especially for npx which needs to download packages)
+            # Check if process is still running
+            if self.process.returncode is not None:
+                # Process already exited - read stderr for error
+                stderr = await self.process.stderr.read()
+                stderr_str = stderr.decode().strip() if stderr else "No error output"
+                logger.error(f"❌ MCP server '{self.name}' exited immediately: {stderr_str}")
+                return False
+            
+            # Wait a bit for server to initialize (npx needs to download packages first time)
+            logger.debug(f"   Waiting for server '{self.name}' to start...")
+            await asyncio.sleep(2.0)  # 2 second startup delay
+            
+            # Check again if still running
+            if self.process.returncode is not None:
+                stderr = await self.process.stderr.read()
+                stderr_str = stderr.decode().strip() if stderr else "No error output"
+                logger.error(f"❌ MCP server '{self.name}' crashed during startup: {stderr_str}")
+                return False
             
             # Initialize connection
             init_response = await self._send_request({
@@ -255,12 +276,11 @@ class MCPManager:
         Args:
             workspace_path: Path to workspace directory (looks for .quasar/mcp.json)
         """
+        # Store workspace path for default cwd
+        self.workspace_path = Path(workspace_path) if workspace_path else Path.cwd()
+        
         # Look for config in project's .quasar/ directory (portable)
-        if workspace_path:
-            self.config_path = Path(workspace_path) / ".quasar" / "mcp.json"
-        else:
-            # Fallback to current directory
-            self.config_path = Path.cwd() / ".quasar" / "mcp.json"
+        self.config_path = self.workspace_path / ".quasar" / "mcp.json"
         
         self.servers: Dict[str, MCPServer] = {}
         
@@ -309,12 +329,40 @@ class MCPManager:
                     logger.info(f"⏭️ Skipping disabled server '{name}'")
                     continue
                 
+                # Parse command - handle both formats:
+                # Format 1: "command": ["npx", "-y", "package"]
+                # Format 2: "command": "npx", "args": ["-y", "package"]
                 command = server_config.get("command", [])
                 if isinstance(command, str):
                     command = [command]
                 
+                # Merge args if provided separately
+                args = server_config.get("args", [])
+                if args:
+                    command = command + args
+                
+                # Windows fix: npx/npm need .cmd extension
+                if os.name == 'nt' and command:
+                    if command[0] in ('npx', 'npm', 'node'):
+                        # Check if .cmd version exists
+                        import shutil
+                        cmd_path = shutil.which(command[0] + '.cmd')
+                        if cmd_path:
+                            command[0] = command[0] + '.cmd'
+                        else:
+                            # Try full path
+                            full_path = shutil.which(command[0])
+                            if full_path:
+                                command[0] = full_path
+                
+                logger.debug(f"MCP server '{name}' command: {command}")
+                
                 env = server_config.get("env", {})
                 cwd = server_config.get("cwd")
+                
+                # Default cwd to workspace directory for relative paths
+                if not cwd and self.workspace_path:
+                    cwd = str(self.workspace_path)
                 
                 # Create and connect server
                 server = MCPServer(name, command, env=env, cwd=cwd)
