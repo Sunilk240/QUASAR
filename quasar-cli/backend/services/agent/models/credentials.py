@@ -101,43 +101,44 @@ class CredentialManager:
         return settings.get(key, default)
     
     def _load_credentials(self):
-        """Load credentials from environment variables."""
+        """
+        Load credentials from environment variables.
+
+        Providers:
+          ollama    — no key needed (URL-based auth)
+          custom_1  — reads CUSTOM_1_API_KEY_1 / CUSTOM_1_API_KEY_2 (+ plain CUSTOM_1_API_KEY)
+          custom_2  — reads CUSTOM_2_API_KEY_1 / CUSTOM_2_API_KEY_2
+          custom_3  — reads CUSTOM_3_API_KEY_1 / CUSTOM_3_API_KEY_2
+          custom_4  — reads CUSTOM_4_API_KEY_1 / CUSTOM_4_API_KEY_2
+        """
         logger.info("🔑 Loading credentials from .env...")
-        
-        # Cerebras
-        cerebras_creds = ProviderCredentials()
-        for i in [1, 2]:
-            key = os.getenv(f"CEREBRAS_API_KEY_{i}")
-            if key:
-                cerebras_creds.credentials.append(Credential(key=key))
-        self._providers["cerebras"] = cerebras_creds
-        logger.info(f"  Cerebras: {len(cerebras_creds.credentials)} keys loaded")
-        
-        # Groq
-        groq_creds = ProviderCredentials()
-        for i in [1, 2]:
-            key = os.getenv(f"GROQ_API_KEY_{i}")
-            if key:
-                groq_creds.credentials.append(Credential(key=key))
-        self._providers["groq"] = groq_creds
-        logger.info(f"  Groq: {len(groq_creds.credentials)} keys loaded")
-        
-        # Cloudflare (needs account_id + token)
-        cloudflare_creds = ProviderCredentials()
-        for i in [1, 2]:
-            account_id = os.getenv(f"CLOUDFLARE_ACCOUNT_ID_{i}")
-            token = os.getenv(f"CLOUDFLARE_API_TOKEN_{i}")
-            if account_id and token:
-                # Store as dict for cloudflare
-                cloudflare_creds.credentials.append(
-                    Credential(key=f"{account_id}:{token}")
-                )
-        self._providers["cloudflare"] = cloudflare_creds
-        
-        # Ollama - no credentials needed (local)
+
+        # Ollama — no credentials needed (URL handles auth for cloud tags)
         self._providers["ollama"] = ProviderCredentials(
             credentials=[Credential(key="local")]
         )
+
+        # Custom slots 1–4 — each is a fully independent provider
+        for n in [1, 2, 3, 4]:
+            provider_name = f"custom_{n}"
+            prefix = f"CUSTOM_{n}_"
+            slot_creds = ProviderCredentials()
+
+            # Numbered rotation keys: CUSTOM_N_API_KEY_1, CUSTOM_N_API_KEY_2
+            for i in [1, 2, 3, 4]:
+                key = os.getenv(f"{prefix}API_KEY_{i}")
+                if key:
+                    slot_creds.credentials.append(Credential(key=key))
+
+            # Plain CUSTOM_N_API_KEY as single-key shorthand
+            if not slot_creds.credentials:
+                single = os.getenv(f"{prefix}API_KEY")
+                if single:
+                    slot_creds.credentials.append(Credential(key=single))
+
+            self._providers[provider_name] = slot_creds
+            logger.info(f"  {provider_name}: {len(slot_creds.credentials)} key(s) loaded")
+
     
     def get_key_count(self, provider: str) -> int:
         """Get number of active keys for a provider."""
@@ -147,11 +148,13 @@ class CredentialManager:
         return sum(1 for c in provider_creds.credentials if c.is_active)
     
     def get_total_key_count(self) -> int:
-        """Get total number of keys across all providers (for retry calculation)."""
-        total = 0
-        for provider in ["cerebras", "groq", "cloudflare", "ollama"]:
-            total += self.get_key_count(provider)
-        logger.info(f"📊 Total keys available: {total}")
+        """Get total number of keys across all loaded providers (for retry calculation)."""
+        total = sum(
+            self.get_key_count(prov)
+            for prov in self._providers
+            if prov != "ollama"  # Ollama uses a synthetic key, don't count it
+        )
+        logger.info(f"📊 Total API keys available: {total}")
         return total
     
     def _get_provider_creds(self, provider: str) -> Optional[ProviderCredentials]:
@@ -180,18 +183,7 @@ class CredentialManager:
         
         return None
     
-    def get_cloudflare_credentials(self) -> Optional[tuple]:
-        """
-        Get Cloudflare credentials (account_id, token).
-        
-        Returns:
-            Tuple of (account_id, token) or None
-        """
-        key = self.get_credential("cloudflare")
-        if key and ":" in key:
-            return tuple(key.split(":", 1))
-        return None
-    
+
     def rotate_credential(self, provider: str) -> bool:
         """
         Rotate to next credential (when rate limited).
@@ -269,14 +261,22 @@ class CredentialManager:
         return sum(1 for c in provider_creds.credentials if c.is_active)
     
     def is_provider_available(self, provider: str) -> bool:
-        """Check if provider has available credentials."""
+        """Check if provider has available credentials / is usable."""
+        import os
         if provider == "ollama":
-            return True  # Always available (local)
-            
+            return True  # Ollama always reachable (local or cloud via URL)
+
+        if provider.startswith("custom"):
+            # Slot is available only if its CUSTOM_N_BASE_URL is configured.
+            # Derive the env var name: custom_1 -> CUSTOM_1_BASE_URL
+            slot = provider.split("_", 1)[1] if "_" in provider else ""
+            env_key = f"CUSTOM_{slot.upper()}_BASE_URL" if slot else "CUSTOM_BASE_URL"
+            return bool(os.getenv(env_key, "").strip())
+
         provider_creds = self._get_provider_creds(provider)
         if not provider_creds or not provider_creds.credentials:
             return False
-            
+
         return any(c.is_active for c in provider_creds.credentials)
     
     def get_status(self) -> Dict[str, Any]:

@@ -227,41 +227,64 @@ class ContextManager:
         return "text"
     
     def _trigger_summarization(self):
-        """Summarize older messages into a useful context."""
+        """Build a structured session summary from in-memory session data.
+
+        Uses session tracking (files_created, files_modified, errors_encountered)
+        and message metadata (roles, task_types) to build a reliable summary.
+
+        Deliberately sync and LLM-free to avoid deadlock: this is called from
+        add_message() which is called inside the async streaming loop. Calling
+        loop.run_until_complete() here would deadlock. The LLM summarizer in
+        summarizer.py is preserved for future use outside the streaming boundary.
+        """
         old_messages = self.conversation_history[:-self.summarize_threshold]
-        
-        if old_messages:
-            # Build a more descriptive summary
-            summary_parts = []
-            
-            # Extract key actions from messages
-            for msg in old_messages:
-                content_lower = msg.content.lower()[:200]  # First 200 chars
-                
-                # Look for phase/task completion markers
-                if 'phase' in content_lower and ('complete' in content_lower or 'done' in content_lower):
-                    summary_parts.append(f"Completed phase mentioned in conversation")
-                elif msg.role == 'user' and msg.task_type:
-                    # Summarize what user asked for
-                    if 'implement' in content_lower or 'create' in content_lower:
-                        summary_parts.append(f"User requested implementation/creation")
-                    elif 'fix' in content_lower or 'bug' in content_lower:
-                        summary_parts.append(f"User requested bug fix")
-                    elif 'explain' in content_lower:
-                        summary_parts.append(f"User asked for explanation")
-            
-            # Add file activity
-            if self.session.files_created:
-                summary_parts.append(f"Created: {', '.join(self.session.files_created[-3:])}")
-            if self.session.files_modified:
-                summary_parts.append(f"Modified: {', '.join(self.session.files_modified[-3:])}")
-            
-            # Build final summary
-            user_count = sum(1 for m in old_messages if m.role == "user")
-            self.conversation_summary = f"Previous {user_count} exchanges. " + "; ".join(summary_parts[:5])
-            
-            # Keep only recent messages
-            self.conversation_history = self.conversation_history[-self.summarize_threshold:]
+
+        if not old_messages:
+            return
+
+        # Gather real data from session
+        user_turns = [m for m in old_messages if m.role == "user"]
+        assistant_turns = [m for m in old_messages if m.role == "assistant"]
+
+        # Deduplicated task types in order they appeared
+        task_types = list(dict.fromkeys(
+            m.task_type for m in old_messages if getattr(m, "task_type", None)
+        ))
+
+        files_created = ", ".join(self.session.files_created[-5:]) if self.session.files_created else ""
+        files_modified = ", ".join(self.session.files_modified[-5:]) if self.session.files_modified else ""
+        errors = ", ".join(self.session.errors_encountered[-3:]) if self.session.errors_encountered else ""
+
+        # Build structured summary
+        parts = [
+            f"Previous conversation: {len(user_turns)} user requests, "
+            f"{len(assistant_turns)} assistant responses."
+        ]
+        if task_types:
+            parts.append(f"Task types: {', '.join(task_types)}.")
+        if files_created:
+            parts.append(f"Files created: {files_created}.")
+        if files_modified:
+            parts.append(f"Files modified: {files_modified}.")
+        if errors:
+            parts.append(f"Errors encountered: {errors}.")
+
+        # Include last user request for continuity
+        if user_turns:
+            last_req = user_turns[-1].content[:150].replace("\n", " ")
+            parts.append(f'Last request: "{last_req}".')
+
+        self.conversation_summary = " ".join(parts)
+
+        # Keep only recent messages
+        self.conversation_history = self.conversation_history[-self.summarize_threshold:]
+
+        import logging
+        logging.getLogger(__name__).info(
+            f"Summarized {len(old_messages)} messages into "
+            f"{len(self.conversation_summary)} char summary (sync)"
+        )
+
     
     def to_dict(self) -> Dict[str, Any]:
         """Export context to dictionary (for persistence)."""

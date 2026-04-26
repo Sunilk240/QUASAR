@@ -82,8 +82,9 @@ def _get_progress_message(tool_name: str, tool_args: dict) -> str:
         'list_directory': f"Listing directory `{path or '.'}`...",
         
         # Terminal tools
-        'suggest_command': f"Suggesting command...",
+        'suggest_command': "Suggesting command...",
         'check_command_available': f"Checking if `{tool_args.get('command', '')}` is available...",
+        'run_command': f"Running `{tool_args.get('command', '')[:50]}`...",
         
         # Web tools
         'suggest_web_search': f"Suggesting search for \"{tool_args.get('query', '')}\"...",
@@ -164,9 +165,10 @@ class AgenticExecutor:
     Supports both synchronous and streaming execution modes.
     """
     
-    def __init__(self, model_router, config=None):
+    def __init__(self, model_router, config=None, context_manager=None):
         self.model_router = model_router
         self.config = config or AgentConfig
+        self.context_manager = context_manager  # P10: wired session context tracking
         self.verifier = None  # Will be set when workspace is known
         self.hooks_manager = None  # Will be set when workspace is known
         agent_logger.info("🔧 AgenticExecutor initialized")
@@ -338,8 +340,11 @@ class AgenticExecutor:
                         if tools:
                             try:
                                 current_model = current_model.bind_tools(tools)
-                            except:
-                                pass
+                            except Exception as bind_err:
+                                agent_logger.warning(
+                                    f"⚠️ bind_tools failed after key rotation "
+                                    f"({provider}): {bind_err} — continuing without tools"
+                                )
                         continue  # Try again with new key
                 
                 # No more keys for this provider
@@ -515,8 +520,14 @@ class AgenticExecutor:
                             if tools:
                                 try:
                                     current_model = current_model.bind_tools(tools)
-                                except:
-                                    pass
+                                    agent_logger.info(f"✅ Tools rebound for rotated {current_provider} key")
+                                except Exception as bind_err:
+                                    agent_logger.error(
+                                        f"❌ bind_tools FAILED on rotated {current_provider} key: {bind_err}. "
+                                        "Marking provider exhausted."
+                                    )
+                                    exhausted_providers.add(current_provider)
+                                    break  # Fall through to next provider in chain
                             continue  # Try again with new key
                     
                     # No more keys for this provider
@@ -591,9 +602,72 @@ class AgenticExecutor:
             if models_chain:
                 provider, model_key = models_chain[0]
                 provider_config = self.config.get_provider(provider)
-                model_name = provider_config.models[model_key].name if provider_config and model_key in provider_config.models else "unknown"
+                if provider_config and model_key in provider_config.models:
+                    # Named model in config (e.g. ollama/glm-4.7:cloud)
+                    model_name = provider_config.models[model_key].name
+                else:
+                    # custom_N providers: model_key IS already the real model name
+                    # (get_models_for_task already resolved __env__ → CUSTOM_N_MODEL)
+                    model_name = model_key
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # P7: Pre-task planning for complex queries
+        # Only runs for file/code tasks with a query > 80 chars.
+        # Produces a numbered plan that is injected as a SystemMessage so the
+        # model knows what it's about to do before the first tool call.
+        # ─────────────────────────────────────────────────────────────────────
+        _planning_task_types = {"file_operations", "execution", "code_intelligence"}
+        _last_human = next(
+            (m for m in reversed(current_messages) if getattr(m, "type", "") == "human"),
+            None,
+        )
+        _query_len = len(getattr(_last_human, "content", "")) if _last_human else 0
+
+        if task_type in _planning_task_types and _query_len > 80:
+            try:
+                from langchain_core.messages import HumanMessage as _HM
+                _plan_prompt = (
+                    "You are a planning assistant. Given the task below, write a concise "
+                    "numbered execution plan (3-7 steps). Be specific about WHICH files to "
+                    "read/modify and WHAT changes to make. No preamble, just the numbered list.\n\n"
+                    f"Task: {getattr(_last_human, 'content', '')[:500]}"
+                )
+                _plan_response = await model.ainvoke([_HM(content=_plan_prompt)])
+                _plan_text = getattr(_plan_response, "content", "").strip()
+
+                if _plan_text:
+                    agent_logger.info(f"📋 Pre-task plan generated ({len(_plan_text)} chars)")
+                    from langchain_core.messages import SystemMessage as _SM
+                    current_messages.append(_SM(content=(
+                        f"EXECUTION PLAN (follow this order):\n{_plan_text}"
+                    )))
+                    yield {"type": "plan_generated", "plan": _plan_text}
+            except Exception as _plan_err:
+                # Planning is best-effort — never block the main loop
+                agent_logger.warning(f"⚠️ Pre-task planning skipped: {_plan_err}")
+
+        import time as _time
+        _session_start = _time.monotonic()  # P12: session timer
+
         
         while iteration < max_iter:
+            # P12: Session-level timeout check (Python 3.10-compatible)
+            elapsed = _time.monotonic() - _session_start
+            if elapsed > self.config.SESSION_TIMEOUT_SECONDS:
+                agent_logger.error(
+                    f"⏰ Session timeout: {elapsed:.0f}s elapsed, "
+                    f"limit is {self.config.SESSION_TIMEOUT_SECONDS}s"
+                )
+                yield {
+                    "type": "error",
+                    "message": (
+                        f"Query timed out after {int(elapsed)}s "
+                        f"(limit: {self.config.SESSION_TIMEOUT_SECONDS}s). "
+                        "Try a more specific request or break it into smaller steps."
+                    )
+                }
+                return
+
             iteration += 1
             remaining = max_iter - iteration
             agent_logger.info(f"🔄 Streaming agentic loop iteration {iteration}/{max_iter}")
@@ -755,9 +829,81 @@ You MUST provide this summary NOW as this is your LAST chance to speak.
                         yield {"type": "debug", "content": f"🔧 [DEBUG] Executing tool: {tool_name} with args: {tool_args}"}
                         yield {"type": "tool_start", "tool": tool_name, "args": tool_args}
                     
-                    # Execute all tools (parallel + sequential)
-                    tool_messages = await tool_executor.execute_tool_calls(tool_calls)
+                    # Execute all tools (parallel + sequential).
+                    # IMPORTANT: use all_tool_calls (post-hook filtered list),
+                    # NOT the original tool_calls variable — hooks that set
+                    # allow=False must actually prevent execution.
+                    tool_messages = await tool_executor.execute_tool_calls(all_tool_calls)
+
+                    # ----------------------------------------------------------------
+                    # P5: Confirmation gate — scan results for requires_confirmation
+                    # sentinel returned by run_command for non-safe commands.
+                    # Hold execution until user responds Allow/Deny in the terminal.
+                    # The session timer is PAUSED during the wait.
+                    # ----------------------------------------------------------------
+                    import json as _json
+                    from ..tools.confirmation_gate import get_confirmation_gate as _get_gate
+                    from ..tools.terminal_tools import _execute_command as _exec_cmd
+
+                    for _msg_idx, _tm in enumerate(tool_messages):
+                        try:
+                            _result_data = _json.loads(_tm.content)
+                        except (ValueError, TypeError):
+                            continue
+
+                        if not isinstance(_result_data, dict):
+                            continue
+                        if not _result_data.get("requires_confirmation"):
+                            continue
+
+                        # Found a confirmation sentinel
+                        _pending_cmd = _result_data.get("command", "")
+                        _pending_reason = _result_data.get("reason", "")
+                        _gate = _get_gate()
+
+                        # Yield event for CLI to display
+                        yield {
+                            "type": "command_confirmation_required",
+                            "command": _pending_cmd,
+                            "reason": _pending_reason,
+                        }
+
+                        # Pause session timer while user is reading / deciding
+                        _pause_start = _time.monotonic()
+
+                        # Await gate indefinitely — no timeout, no auto-deny
+                        _approved = await _gate.wait_for_decision()
+
+                        # Resume session timer (subtract wait time from elapsed)
+                        _session_start += (_time.monotonic() - _pause_start)
+
+                        if _approved:
+                            agent_logger.info(f"run_command APPROVED by user: {_pending_cmd[:60]!r}")
+                            _exec_result = _exec_cmd(_pending_cmd)
+                        else:
+                            agent_logger.info(f"run_command DENIED by user: {_pending_cmd[:60]!r}")
+                            _exec_result = {
+                                "success": False,
+                                "blocked": True,
+                                "exit_code": -1,
+                                "stdout": "",
+                                "stderr": "User denied execution.",
+                                "command": _pending_cmd,
+                            }
+
+                        # Replace the sentinel ToolMessage content with the real result.
+                        # tool_messages is not yet in current_messages — we just mutate
+                        # it in-place here so the normal append block below picks up the
+                        # correct (already-confirmed) result automatically.
+                        from langchain_core.messages import ToolMessage as _ToolMessage
+                        tool_messages[_msg_idx] = _ToolMessage(
+                            content=_json.dumps(_exec_result),
+                            tool_call_id=_tm.tool_call_id,
+                        )
+
+                    # Append all tool results (confirmed ones already patched in-place above)
                     current_messages.extend(tool_messages)
+
                     
                     # Process results for each tool
                     for i, tool_call in enumerate(all_tool_calls):
@@ -806,10 +952,20 @@ You MUST provide this summary NOW as this is your LAST chance to speak.
                             if hook_result.message:
                                 yield {"type": "message", "content": hook_result.message}
                         
-                        # File tree update for file-modifying operations
-                        file_modifying_tools = ["create_file", "delete_file", "modify_file", "move_file", "rename_file"]
+                        # Track file changes in session context + notify CLI
+                        file_modifying_tools = [
+                            "create_file", "delete_file", "modify_file",
+                            "patch_file", "move_file", "rename_file"
+                        ]
                         if tool_name in file_modifying_tools:
-                            yield {"type": "file_tree_updated"}
+                            # P10: Record in context manager so system prompt stays accurate
+                            if self.context_manager:
+                                path = tool_args.get("path", tool_args.get("file_path", ""))
+                                if path:
+                                    if tool_name == "create_file":
+                                        self.context_manager.record_file_created(path)
+                                    elif tool_name in ("modify_file", "patch_file"):
+                                        self.context_manager.record_file_modified(path)
                     
                     continue
                 else:

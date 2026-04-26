@@ -104,23 +104,31 @@ class TaskClassifier:
             has_error=has_error
         )
         
-        # Try Groq llama-3.3-70b-versatile first
-        agent_logger.debug("Attempting Groq (llama-3.3-70b-versatile) for classification...")
-        model = self.model_router.get_model_for_provider("groq", "llama-3.3-70b-versatile")
-        provider = "groq"
-        model_name = "llama-3.3-70b-versatile"
-        
+        # Select classification model using TASK_MODELS priority chain
+        # This aligns with execution priority: Cerebras first, then Ollama cloud, then Groq
+        from ..config import AgentConfig
+        model = None
+        provider = "unknown"
+        model_name = "unknown"
+
+        for prov, model_key in AgentConfig.get_models_for_task("classification"):
+            candidate = self.model_router.get_model_for_provider(prov, model_key)
+            if candidate is not None:
+                model = candidate
+                provider = prov
+                provider_config = AgentConfig.get_provider(prov)
+                model_name = (
+                    provider_config.models[model_key].name
+                    if provider_config and model_key in provider_config.models
+                    else model_key
+                )
+                agent_logger.info(f"Classification using: {provider}/{model_name}")
+                break
+
         if model is None:
-            agent_logger.warning("Groq not available, trying Cerebras zai-glm-4.7...")
-            # Fallback to Cerebras
-            model = self.model_router.get_model_for_provider("cerebras", "zai-glm-4.7")
-            provider = "cerebras"
-            model_name = "zai-glm-4.7"
-        
-        if model is None:
-            agent_logger.warning("No cloud models available, using keyword fallback")
+            agent_logger.warning("No model available for classification — using keyword fallback")
             return self._fallback_classification(query)
-        
+
         # Log which model we're using
         log_model_call(provider, model_name, "classification")
         

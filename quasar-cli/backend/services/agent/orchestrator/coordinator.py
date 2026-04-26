@@ -67,7 +67,7 @@ class Orchestrator:
         
         self.classifier = TaskClassifier(self.model_router)
         self.prompt_builder = PromptBuilder(self.context_manager, self.project_context)
-        self.executor = AgenticExecutor(self.model_router, AgentConfig)
+        self.executor = AgenticExecutor(self.model_router, AgentConfig, self.context_manager)
         self.stream_handler = StreamHandler()
         
         # Initialize MCP manager (looks for .quasar/mcp.json in project)
@@ -271,7 +271,15 @@ class Orchestrator:
             if models_chain:
                 provider_name, model_key = models_chain[0]
                 provider_config = AgentConfig.get_provider(provider_name)
-                model_name = provider_config.models[model_key].name if provider_config and model_key in provider_config.models else "unknown"
+                if provider_config and model_key in provider_config.models:
+                    # Named model in config (e.g. ollama/glm-4.7:cloud)
+                    model_name = provider_config.models[model_key].name
+                elif provider_name.startswith("custom"):
+                    # Custom slot: model_key was already resolved from CUSTOM_N_MODEL
+                    # by get_models_for_task, so model_key IS the real model name.
+                    model_name = model_key
+                else:
+                    model_name = model_key
             else:
                 provider_name = "unknown"
                 model_name = "unknown"

@@ -59,46 +59,65 @@ def get_orchestrator() -> Orchestrator:
 
 
 def check_api_keys() -> bool:
-    """Check if any API keys are configured."""
-    cred_manager = CredentialManager()
-    status = cred_manager.get_status()
-    
-    available = [name for name, info in status.items() if info.get("has_credentials")]
-    
-    if not available or available == ["ollama"]:
-        console.print(Panel(
-            "[bold red]⚠️  No API keys found![/bold red]\n\n"
-            "Please set at least one of these environment variables:\n\n"
-            "  [green]GROQ_API_KEY_1[/green]=gsk_...\n"
-            "  [green]CEREBRAS_API_KEY_1[/green]=csk_...\n"
-            "  [green]OPENAI_API_KEY_1[/green]=sk_...\n\n"
-            "You can add multiple keys: GROQ_API_KEY_2, etc.\n\n"
-            "[dim]Get API keys at:[/dim]\n"
-            "  Groq: https://console.groq.com\n"
-            "  Cerebras: https://cloud.cerebras.ai",
-            title="Setup Required",
-            border_style="red"
-        ))
-        return False
-    
-    console.print(f"[dim]✓ Available providers: {', '.join(available)}[/dim]")
-    return True
+    """
+    Check provider configuration and show startup status.
+
+    Ollama is ALWAYS available as a fallback.
+    Up to 4 independent custom slots (CUSTOM_1_*, CUSTOM_2_*, etc.) are shown
+    if configured. We never block startup — bad URLs surface at query time.
+    """
+    import os
+
+    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_status = f"[green]ollama[/green] ({ollama_url})"
+
+    # Show all 4 custom slots
+    slot_parts = []
+    any_custom_configured = False
+    for n in [1, 2, 3, 4]:
+        base_url = os.getenv(f"CUSTOM_{n}_BASE_URL", "").strip()
+        model    = os.getenv(f"CUSTOM_{n}_MODEL", "").strip()
+        if base_url and model:
+            slot_parts.append(f"[green]slot{n}[/green] ({base_url} / {model})")
+            any_custom_configured = True
+        else:
+            slot_parts.append(f"[dim]slot{n}:off[/dim]")
+
+    custom_summary = " | ".join(slot_parts)
+    console.print(f"[dim]✓ Providers: {ollama_status}[/dim]")
+    console.print(f"[dim]  Custom slots: {custom_summary}[/dim]")
+
+    if not any_custom_configured:
+        console.print(
+            "[dim yellow]  ⚠ No custom slots configured. "
+            "Set CUSTOM_1_BASE_URL + CUSTOM_1_MODEL + CUSTOM_1_API_KEY_1 to add a provider.[/dim yellow]"
+        )
+
+    return True  # Ollama is always the fallback; never block startup
+
 
 
 async def process_query(query: str, workspace: str, selected_model: Optional[str] = None) -> None:
     """Process a single query and stream the response with rich visual feedback."""
+    # Issue 3: Reset the ConfirmationGate before each query so stale state from
+    # a previous abnormally-terminated query (e.g. Ctrl-C mid-confirmation) is
+    # cleared. Any leaked awaiter is unblocked with a deny before being released.
+    from services.agent.tools.confirmation_gate import get_confirmation_gate as _gcg
+    _gcg().reset()
+
     orchestrator = get_orchestrator()
     orchestrator.set_workspace(workspace)
-    
+
     # Load MCP servers if not already loaded
     if orchestrator.mcp_manager and not orchestrator.mcp_tools:
         mcp_count = await orchestrator.load_mcp_servers()
         if mcp_count > 0:
             console.print(f"[dim]🔌 Loaded {mcp_count} MCP server(s) with {len(orchestrator.mcp_tools)} tools[/dim]")
-    
+
     response_text = ""
     current_tool = None
     plan_shown = False
+
     
     with Progress(
         SpinnerColumn(),
@@ -133,6 +152,23 @@ async def process_query(query: str, workspace: str, selected_model: Optional[str
                         console.print("\n[bold cyan]📋 Plan:[/bold cyan]")
                         for i, step in enumerate(steps, 1):
                             console.print(f"  [cyan]{i}.[/cyan] {step}")
+                        console.print()
+                        plan_shown = True
+                        progress.start()
+
+                elif chunk_type == "plan_generated":
+                    # P7: Pre-task plan — shown before the agentic loop begins
+                    plan_text = chunk.get("plan", "")
+                    if plan_text and not plan_shown:
+                        progress.stop()
+                        console.print(
+                            Panel(
+                                f"[dim]{plan_text}[/dim]",
+                                title="[bold dim cyan]📋 Execution Plan[/bold dim cyan]",
+                                border_style="dim cyan",
+                                padding=(0, 1),
+                            )
+                        )
                         console.print()
                         plan_shown = True
                         progress.start()
@@ -211,6 +247,61 @@ async def process_query(query: str, workspace: str, selected_model: Optional[str
                     # Debug messages (only show if verbose mode)
                     # For now, skip debug messages in normal mode
                     pass
+
+                elif chunk_type == "file_tree_updated":
+                    # Acknowledged — context_manager now tracks file changes (P10)
+                    # file_changed events show the details to the user
+                    pass
+
+                elif chunk_type == "command_confirmation_required":
+                    # ─────────────────────────────────────────────────────
+                    # run_command needs user approval.
+                    # Execution HOLDS here until the user responds.
+                    # No auto-approve, no auto-deny, no timeout.
+                    # ─────────────────────────────────────────────────────
+                    cmd = chunk.get("command", "")
+                    reason = chunk.get("reason", "")
+
+                    progress.stop()
+                    console.print()
+                    console.print(
+                        Panel(
+                            f"[bold yellow]⚡ run_command wants to execute:[/bold yellow]\n\n"
+                            f"  [bold white]{cmd}[/bold white]\n\n"
+                            f"[dim]Reason: {reason}[/dim]\n\n"
+                            "[green]y[/green] = Allow   [red]n[/red] = Deny",
+                            title="[bold yellow]Command Confirmation Required[/bold yellow]",
+                            border_style="yellow",
+                        )
+                    )
+
+                    # Await input without blocking the event loop
+                    # run_in_executor runs console.input() in a thread,
+                    # allowing the event loop to process the gate.wait_for_decision()
+                    # coroutine in the executor concurrently.
+                    _loop = asyncio.get_event_loop()
+                    try:
+                        user_choice = await _loop.run_in_executor(
+                            None,
+                            lambda: console.input(
+                                "[bold green]>[/bold green] Allow? [[green]y[/green]/[red]n[/red]]: "
+                            ).strip().lower()
+                        )
+                    except (EOFError, KeyboardInterrupt):
+                        user_choice = "n"
+
+                    from services.agent.tools.confirmation_gate import get_confirmation_gate as _get_conf_gate
+                    _gate = _get_conf_gate()
+                    if user_choice in ("y", "yes", "allow", "a", "1"):
+                        console.print("[green]✓ Allowed — executing command...[/green]")
+                        _gate.approve()
+                    else:
+                        console.print("[red]✗ Denied — command will not run.[/red]")
+                        _gate.deny()
+
+                    console.print()
+                    progress.start()
+
                 
                 elif chunk_type == "token":
                     # Streaming response text - collect it
@@ -262,7 +353,16 @@ async def process_query(query: str, workspace: str, selected_model: Optional[str
 
 
 def run_repl(workspace: str, selected_model: Optional[str] = None) -> None:
-    """Run interactive REPL mode."""
+    """Run interactive REPL mode with a persistent event loop.
+    
+    Uses a single asyncio event loop for the entire session so that
+    MCP server connections (TCP) survive between queries instead of
+    being torn down and rebuilt on every input.
+    """
+    # One persistent loop for the whole REPL session
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     model_info = f"\n[dim]Model: {selected_model}[/dim]" if selected_model else ""
     console.print(Panel(
         "[bold cyan]🚀 QUASAR AI Editor[/bold cyan]\n\n"
@@ -273,15 +373,15 @@ def run_repl(workspace: str, selected_model: Optional[str] = None) -> None:
         "  [green]/quit[/green]  - Exit",
         border_style="cyan"
     ))
-    
+
     while True:
         try:
             console.print()
             query = console.input("[bold green]>[/bold green] ").strip()
-            
+
             if not query:
                 continue
-            
+
             # Handle special commands
             if query.lower() in ["/quit", "/exit", "/q"]:
                 console.print("[dim]Goodbye![/dim]")
@@ -300,15 +400,17 @@ def run_repl(workspace: str, selected_model: Optional[str] = None) -> None:
                     border_style="blue"
                 ))
                 continue
-            
-            # Process the query
-            asyncio.run(process_query(query, workspace, selected_model))
-            
+
+            # Process query on the persistent loop — MCP connections survive
+            loop.run_until_complete(process_query(query, workspace, selected_model))
+
         except KeyboardInterrupt:
             console.print("\n[dim]Use /quit to exit[/dim]")
         except EOFError:
             console.print("\n[dim]Goodbye![/dim]")
             break
+
+    loop.close()
 
 
 @app.command()

@@ -5,7 +5,7 @@ Constructs system prompts with task-specific instructions and context.
 """
 
 from typing import Dict, Any
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from ..types import TaskType
 from ..context import ContextManager
@@ -52,9 +52,17 @@ If a file isn't found, try variations (Tasks.md, task.md, TODO.md).
 Use `explore_codebase()` for quick project overview.
 Use `search_content(query)` to find text across files.
 
-## 5. Suggest Commands, Don't Execute
-Always use `suggest_command()` for terminal operations.
-The user runs commands themselves for safety.
+## 5. Terminal Commands — Two Tools, Different Purposes
+
+**`suggest_command(command)`** — Recommend a command for the USER to run manually.
+Use for: install commands (`pip install ...`), deploy steps, long-running servers.
+The command is shown to the user but NOT executed.
+
+**`run_command(command, reason)`** — Execute a command and capture its output.
+Use for: running tests (`pytest`), checking `git status`, verifying a script works after writing it.
+Non-trivially-safe commands require explicit user confirmation before running.
+ALWAYS check `exit_code` in the result — if non-zero, read `stderr` and fix the issue.
+NEVER use for: `rm -rf`, `sudo`, `format`, `shutdown`, or any destructive operation.
 
 ## 6. Track Complex Projects
 For multi-step work, create or update `Tasks.md` with checkboxes.
@@ -224,10 +232,19 @@ class PromptBuilder:
         if context:
             user_message = f"{context}\n\nUser request: {query}"
         
-        return [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_message)
-        ]
+        messages = [SystemMessage(content=system_prompt)]
+        
+        # Inject recent conversation history so the REPL isn't stateless
+        recent_history = self.context_manager.get_recent_messages(count=8)  # Last 4 turns
+        for msg in recent_history:
+            if msg.role == "user":
+                messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                messages.append(AIMessage(content=msg.content))
+                
+        messages.append(HumanMessage(content=user_message))
+        
+        return messages
     
     def _get_task_instructions(self, task_type: TaskType) -> str:
         """Get task-specific instructions for the 6 task categories."""

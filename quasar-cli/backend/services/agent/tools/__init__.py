@@ -35,7 +35,9 @@ from .web_tools import (
 from .terminal_tools import (
     TERMINAL_TOOLS,
     suggest_command,
-    check_command_available
+    check_command_available,
+    run_command,
+    _execute_command as _terminal_execute_command,
 )
 
 from .search_tools import (
@@ -111,7 +113,7 @@ def get_tools_for_task(task_type: str) -> list:
         "code_intelligence": CODE_INTELLIGENCE_TOOLS + FILE_TOOLS + SEARCH_TOOLS,
         
         # Chat: everything except terminal (safer for casual conversation)
-        "chat": FILE_TOOLS + SEARCH_TOOLS + WEB_TOOLS + CODE_INTELLIGENCE_TOOLS
+        "chat": FILE_TOOLS + SEARCH_TOOLS + WEB_TOOLS + CODE_INTELLIGENCE_TOOLS + TERMINAL_TOOLS
     }
     
     return task_tools.get(task_type, ALL_TOOLS)

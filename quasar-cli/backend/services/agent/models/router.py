@@ -70,29 +70,36 @@ class ModelRouter:
             return self.get_model(task_type, fallback_level + 1, temperature, **kwargs)
         
         logger.debug(f"  ✅ Provider {provider} is available")
-        
-        # Get model config
+
+        # Resolve model name — look up config first, fall back to using key as-is.
+        # This supports providers with no pre-registered models (e.g. 'custom')
+        # where the model_key IS the model name (e.g. "gpt-4o-mini", "qwen-3-235b").
         provider_config = AgentConfig.get_provider(provider)
-        if not provider_config or model_key not in provider_config.models:
-            logger.warning(f"  ⚠️ Model config missing for {provider}/{model_key}, trying next fallback...")
-            return self.get_model(task_type, fallback_level + 1, temperature, **kwargs)
-        
-        model_config = provider_config.models[model_key]
-        logger.info(f"  🎯 Creating model: {provider}/{model_config.name}")
-        
+        if provider_config and model_key in provider_config.models:
+            model_config = provider_config.models[model_key]
+            actual_model_name = model_config.name
+            actual_temperature = temperature or model_config.temperature
+        else:
+            # Pass-through: model_key used as the model name directly
+            actual_model_name = model_key
+            actual_temperature = temperature or 0.7
+            logger.info(f"  ℹ️ Model '{model_key}' not in {provider} config — using as model name directly")
+
+        logger.info(f"  🎯 Creating model: {provider}/{actual_model_name}")
+
         # Create model instance
         model = self.providers.get_model(
             provider=provider,
-            model_name=model_config.name,
-            temperature=temperature or model_config.temperature,
+            model_name=actual_model_name,
+            temperature=actual_temperature,
             **kwargs
         )
-        
+
         if model is None:
-            logger.warning(f"  ❌ Model creation FAILED for {provider}/{model_config.name}, trying next fallback...")
+            logger.warning(f"  ❌ Model creation FAILED for {provider}/{actual_model_name}, trying next fallback...")
             return self.get_model(task_type, fallback_level + 1, temperature, **kwargs)
-        
-        logger.info(f"  ✅ Model created successfully: {provider}/{model_config.name}")
+
+        logger.info(f"  ✅ Model created successfully: {provider}/{actual_model_name}")
         return model
     
     def get_model_for_provider(
@@ -106,7 +113,7 @@ class ModelRouter:
         Get a specific model from a specific provider.
         
         Args:
-            provider: Provider name (ollama, cerebras, groq, cloudflare)
+            provider: Provider name (e.g., 'openai', 'anthropic', 'ollama')
             model_name_or_key: Model name OR config key (e.g., "zai-glm-4.7")
             temperature: Sampling temperature
             
@@ -118,10 +125,10 @@ class ModelRouter:
             logger.error(f"Provider '{provider}' not found in config")
             return None
         
-        # If no model specified, use first model from provider config
+        # If no model specified, use first model from provider config OR model_name_or_key as-is
         if not model_name_or_key:
             if not provider_config.models:
-                logger.error(f"No models configured for provider '{provider}'")
+                logger.error(f"No model name provided and no models configured for provider '{provider}'")
                 return None
             # Get first model key from config
             first_model_key = list(provider_config.models.keys())[0]
@@ -145,9 +152,9 @@ class ModelRouter:
         )
     
     def get_available_providers(self) -> List[str]:
-        """Get list of providers with available credentials."""
+        """Get list of providers with available credentials (dynamic, not hardcoded)."""
         available = []
-        for provider in ["ollama", "cerebras", "groq", "cloudflare"]:
+        for provider in AgentConfig.PROVIDERS:
             if self.cred_manager.is_provider_available(provider):
                 available.append(provider)
         return available
